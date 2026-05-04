@@ -10,7 +10,6 @@ __pycache__/
 *.npy
 *.mmap
 *.bin
-data/
 
 # Model cache
 .cache/
