@@ -1,0 +1,24 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data and embeddings
+*.npy
+*.mmap
+*.bin
+data/
+
+# Model cache
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
