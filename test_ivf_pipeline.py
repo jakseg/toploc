@@ -1,17 +1,25 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import sys
 import faiss
 import numpy as np
 import json
+import torch
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel
 
-print("Testing IVF Pipeline...")
+model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
+data_dir = f"data/{model_name}"
+
+print(f"Testing IVF Pipeline ({model_name})...")
 
 # ================= 1. Load Components =================
 
-index_path = "data/ivf_index.index"
-ivf_index = faiss.read_index(index_path)
+ivf_index = faiss.read_index(f"{data_dir}/ivf_index.index")
 print(f"Loaded IVF index: {ivf_index.ntotal} vectors, trained={ivf_index.is_trained}")
 
-with open("data/passage_id_map.json", "r") as f:
+with open(f"{data_dir}/passage_id_map.json", "r") as f:
     id_map = json.load(f)
 print(f"Loaded ID mapping: {len(id_map)} passages")
 
@@ -21,17 +29,31 @@ print(f"Set nprobe={ivf_index.nprobe}")
 
 # ================= 2. Load Model & Embed Query =================
 
-model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
-print("Snowflake model loaded")
-
 test_query = "What was the Chinese Exclusion Acts In the 1850s?"
 
-# CRITICAL: normalize_embeddings=True matches how passages were encoded
-query_emb = model.encode(
-    [test_query],
-    normalize_embeddings=True,
-    convert_to_numpy=True
-).astype("float32")
+if model_name == "snowflake":
+    model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
+    print("Snowflake model loaded")
+    # CRITICAL: normalize_embeddings=True matches how passages were encoded
+    query_emb = model.encode(
+        [test_query],
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    ).astype("float32")
+elif model_name == "dragon":
+    tokenizer = AutoTokenizer.from_pretrained("facebook/dragon-plus-query-encoder")
+    model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
+    model.eval()
+    print("Dragon query encoder loaded")
+    tokens = tokenizer([test_query], padding=True, truncation=True, max_length=512, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**tokens)
+        query_emb = outputs.last_hidden_state[:, 0, :]
+        query_emb = torch.nn.functional.normalize(query_emb, p=2, dim=1)
+    query_emb = query_emb.cpu().numpy().astype("float32")
+else:
+    raise ValueError(f"Unknown model: {model_name}")
+
 print(f"Query embedded: shape={query_emb.shape}, dim={query_emb.shape[1]}")
 
 # ================= 3. Run Search =================

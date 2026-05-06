@@ -7,7 +7,6 @@ __pycache__/
 *.pyo
 
 # Data and embeddings
-*.npy
 *.mmap
 *.bin
 

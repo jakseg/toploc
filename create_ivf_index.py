@@ -1,19 +1,23 @@
+import sys
 import faiss
 import numpy as np
 import json
 import time
 
+model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
+data_dir = f"data/{model_name}"
+
 # 1. Load your embeddings
 print("Loading embeddings...")
-embeddings = np.load("data/passage_embeddings_subset.npy")
+embeddings = np.load(f"{data_dir}/passage_embeddings.npy")
 print(f"Loaded {embeddings.shape[0]} embeddings of dimension {embeddings.shape[1]}")
 
 # 2. Load ID map (for later evaluation)
-with open("data/passage_id_map.json", "r") as f:
+with open(f"{data_dir}/passage_id_map.json", "r") as f:
     id_map = json.load(f)
 
 # 3. IVF Parameters (adjusted for small dataset)
-dim = embeddings.shape[1]  # 1024 for Snowflake
+dim = embeddings.shape[1]  # 1024 for Snowflake, 768 for Dragon
 num_centroids = 64  # For 2k docs, use 64-128 (paper uses 32768 for 38M docs)
 nprobe = 8  # Number of centroids to search (we'll tune this later)
 
@@ -41,8 +45,8 @@ ivf_index.nprobe = nprobe
 print(f"Set nprobe={nprobe}")
 
 # 8. Save the index
-faiss.write_index(ivf_index, "data/ivf_index.index")
-print("\n IVF index saved to: data/ivf_index.index")
+faiss.write_index(ivf_index, f"{data_dir}/ivf_index.index")
+print(f"\n IVF index saved to: {data_dir}/ivf_index.index")
 
 # 9. Verify index stats
 print(f"\n Index Statistics:")

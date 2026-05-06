@@ -1,11 +1,19 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import sys
 import json
 import time
 import math
 import numpy as np
 import faiss
+import torch
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
+
+model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
+data_dir = f"data/{model_name}"
 
 # ================= METRIC FUNCTIONS =================
 def dcg(scores, k):
@@ -27,16 +35,39 @@ def mrr(retrieved_ids, qrel_dict, k=10):
             return 1.0 / rank
     return 0.0
 
+# ================= QUERY ENCODER =================
+def load_query_encoder(model_name):
+    if model_name == "snowflake":
+        model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
+        def encode(query):
+            return model.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
+        return encode
+    elif model_name == "dragon":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/dragon-plus-query-encoder")
+        model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
+        model.eval()
+        def encode(query):
+            tokens = tokenizer([query], padding=True, truncation=True, max_length=512, return_tensors="pt")
+            with torch.no_grad():
+                outputs = model(**tokens)
+                emb = outputs.last_hidden_state[:, 0, :]
+                emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            return emb.cpu().numpy().astype("float32")
+        return encode
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
 # ================= LOAD DATA =================
+print(f"Evaluating baseline for: {model_name}")
 print("Loading components...")
 
 # 1. FAISS Index
-index = faiss.read_index("data/ivf_index.index")
+index = faiss.read_index(f"{data_dir}/ivf_index.index")
 index.nprobe = 8  # Baseline nprobe (tune later)
 print(f"IVF index loaded: {index.ntotal} vectors, trained={index.is_trained}")
 
 # 2. ID Mapping
-with open("data/passage_id_map.json", "r") as f:
+with open(f"{data_dir}/passage_id_map.json", "r") as f:
     id_map = json.load(f)
 indexed_pids = set(id_map.values())
 print(f"ID map loaded: {len(id_map)} passages")
@@ -76,8 +107,9 @@ print(f"Subset Warning: {len(filtered_qrels)}/{total_turns} turns have relevant 
 print("   (Metrics will be artificially low until you index the full collection)")
 
 # ================= EVALUATION LOOP =================
-print("\nRunning baseline evaluation...")
-model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
+print(f"\nLoading {model_name} query encoder...")
+encode_query = load_query_encoder(model_name)
+print("Running baseline evaluation...")
 
 k = 10
 warmup = 5
@@ -91,11 +123,7 @@ for i, (turn_key, query) in enumerate(topics.items()):
         continue
 
     # Embed query
-    q_emb = model.encode(
-        [query],
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    ).astype("float32")
+    q_emb = encode_query(query)
 
     # Search & measure latency
     start = time.perf_counter()
@@ -116,13 +144,18 @@ for i, (turn_key, query) in enumerate(topics.items()):
 
 # ================= RESULTS =================
 print("\n" + "=" * 60)
-print("BASELINE EVALUATION RESULTS (IVF)")
+print(f"BASELINE EVALUATION RESULTS (IVF, {model_name})")
 print("=" * 60)
 print(f"Turns evaluated: {evaluated_turns}")
 print(f"NDCG@10: {np.mean(ndcgs):.4f}")
 print(f"MRR@10:  {np.mean(mrrs):.4f}")
 print(f"Avg Time: {np.mean(times):.2f} ms")
 print("=" * 60)
-print("\nPaper Baseline Targets (Snowflake, Full Collection):")
-print("   NDCG@10 = 0.497 | MRR@10 = 0.815 | Time = 24.9 ms")
+
+if model_name == "snowflake":
+    print("\nPaper Baseline Targets (Snowflake, Full Collection):")
+    print("   NDCG@10 = 0.497 | MRR@10 = 0.815 | Time = 24.9 ms")
+elif model_name == "dragon":
+    print("\nPaper Baseline Targets (Dragon, Full Collection):")
+    print("   NDCG@10 = 0.486 | MRR@10 = 0.813 | Time = 33.0 ms")
 print("Your scores will be lower due to the 2k passage subset.")
