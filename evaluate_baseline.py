@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
 
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
+index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 data_dir = f"data/{model_name}"
 
 # ================= METRIC FUNCTIONS =================
@@ -61,10 +62,17 @@ def load_query_encoder(model_name):
 print(f"Evaluating baseline for: {model_name}")
 print("Loading components...")
 
-# 1. FAISS Index
-index = faiss.read_index(f"{data_dir}/ivf_index.index")
-index.nprobe = 8  # Baseline nprobe (tune later)
-print(f"IVF index loaded: {index.ntotal} vectors, trained={index.is_trained}")
+# 1. Load index (exact, ivf, or hnsw)
+index = faiss.read_index(f"{data_dir}/{index_type}_index.index")
+print(f"{index_type.upper()} index loaded: {index.ntotal} vectors, trained={index.is_trained}")
+
+# Set search parameters depending on index type
+if index_type == "ivf":
+    index.nprobe = 8  # Number of clusters to scan (tune later)
+    print(f"Set nprobe={index.nprobe}")
+elif index_type == "hnsw":
+    index.hnsw.efSearch = 8  # Number of candidates to explore (tune later)
+    print(f"Set efSearch={index.hnsw.efSearch}")
 
 # 2. ID Mapping
 with open(f"{data_dir}/passage_id_map.json", "r") as f:
@@ -144,7 +152,7 @@ for i, (turn_key, query) in enumerate(topics.items()):
 
 # ================= RESULTS =================
 print("\n" + "=" * 60)
-print(f"BASELINE EVALUATION RESULTS (IVF, {model_name})")
+print(f"BASELINE EVALUATION RESULTS ({index_type.upper()}, {model_name})")
 print("=" * 60)
 print(f"Turns evaluated: {evaluated_turns}")
 print(f"NDCG@10: {np.mean(ndcgs):.4f}")
