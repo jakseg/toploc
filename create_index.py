@@ -58,8 +58,28 @@ elif index_type == "exact":
     index.add(embeddings)
     print(f"Indexing completed in {time.time() - start_time:.2f}s")
 
+elif index_type == "hnsw":
+    # HNSW: graph-based approximate nearest neighbor search
+    M = 16  # Number of connections per node (for 2k docs; paper uses 32-64 for 38M docs)
+    ef_construction = 32  # Controls index build quality
+    ef_search = 8  # Controls search quality (paper tests 2, 4, 8, 16)
+
+    print(f"\nBuilding HNSW index with M={M}, ef_construction={ef_construction}...")
+
+    index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = ef_construction
+
+    print("Adding embeddings to index (includes graph construction)...")
+    start_time = time.time()
+    index.add(embeddings)
+    print(f"Indexing completed in {time.time() - start_time:.2f}s")
+
+    # Set ef_search (how many candidates to explore at search time)
+    index.hnsw.efSearch = ef_search
+    print(f"Set efSearch={ef_search}")
+
 else:
-    print(f"Unknown index type: {index_type}. Use 'ivf' or 'exact'.")
+    print(f"Unknown index type: {index_type}. Use 'ivf', 'exact', or 'hnsw'.")
     sys.exit(1)
 
 # 8. Save the index
