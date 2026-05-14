@@ -33,67 +33,70 @@ INDEX_PARAMS = {
     },
 }
 
+TRAIN_SAMPLE_SIZE = 2_000_000
+BATCH_SIZE = 500_000
+
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 emb_dir = EMBEDDING_DIRS[model_name]
 cache_dir = CACHE_DIRS[model_name]
 os.makedirs(cache_dir, exist_ok=True)
 
-# ================= LOAD PARQUET EMBEDDINGS =================
-def load_parquet_embeddings(emb_dir):
+# ================= HELPERS =================
+def get_parquet_info(emb_dir):
     parquet_files = sorted(glob.glob(os.path.join(emb_dir, "*.parquet")))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found in {emb_dir}")
-    print(f"Found {len(parquet_files)} parquet files in {emb_dir}")
-
     total_rows = sum(pq.read_metadata(pf).num_rows for pf in parquet_files)
-    sample = pq.read_table(parquet_files[0])
-    print(f"Schema: {sample.schema}")
+    sample = pq.read_table(parquet_files[0], columns=["embedding"])
     dim = len(sample.column("embedding")[0].as_py())
-    print(f"Total: {total_rows:,} passages, dim={dim}")
+    return parquet_files, total_rows, dim
 
-    embeddings = np.empty((total_rows, dim), dtype="float32")
-    all_ids = []
-    offset = 0
 
-    for i, pf in enumerate(parquet_files):
+def iter_parquet_batches(parquet_files, dim):
+    for pf in parquet_files:
         table = pq.read_table(pf)
-        n_rows = len(table)
-        all_ids.extend(table.column("id").to_pylist())
-
-        # Arrow -> numpy directly in C, no Python object overhead
-        flat = table.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
-        embeddings[offset:offset + n_rows] = flat.reshape(n_rows, dim)
-        offset += n_rows
-
-        if (i + 1) % 10 == 0 or (i + 1) == len(parquet_files):
-            print(f"  Loaded {i + 1}/{len(parquet_files)} files ({offset:,}/{total_rows:,} passages)")
-
-    embeddings = embeddings[:offset]
-    id_map = {str(i): str(pid) for i, pid in enumerate(all_ids)}
-    return embeddings, id_map
+        ids = table.column("id").to_pylist()
+        try:
+            flat = table.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
+            embs = flat.reshape(len(ids), dim).astype("float32")
+        except Exception:
+            embs = np.array(table.column("embedding").to_pylist(), dtype=np.float32)
+        yield ids, embs
 
 
-npy_path = os.path.join(cache_dir, "passage_embeddings.npy")
+def load_training_sample(parquet_files, dim, n_sample):
+    collected = []
+    total = 0
+    for _, embs in iter_parquet_batches(parquet_files, dim):
+        collected.append(embs)
+        total += len(embs)
+        if total >= n_sample:
+            break
+    sample = np.concatenate(collected)[:n_sample]
+    print(f"Training sample: {len(sample):,} vectors")
+    return sample
+
+
+# ================= ID MAP =================
 id_map_path = os.path.join(cache_dir, "passage_id_map.json")
+parquet_files, total_rows, dim = get_parquet_info(emb_dir)
+print(f"Collection: {total_rows:,} passages, dim={dim}, {len(parquet_files)} parquet files")
 
-if os.path.exists(npy_path) and os.path.exists(id_map_path):
-    print("Loading cached npy embeddings...")
-    embeddings = np.load(npy_path)
-    with open(id_map_path, "r") as f:
-        id_map = json.load(f)
-    print(f"Loaded {embeddings.shape[0]} embeddings of dimension {embeddings.shape[1]}")
-else:
-    print("Loading embeddings from parquet files...")
-    embeddings, id_map = load_parquet_embeddings(emb_dir)
-    print("Caching as npy for faster future loads...")
-    np.save(npy_path, embeddings)
+if not os.path.exists(id_map_path):
+    print("Building passage ID map...")
+    all_ids = []
+    for i, pf in enumerate(parquet_files):
+        table = pq.read_table(pf, columns=["id"])
+        all_ids.extend(table.column("id").to_pylist())
+        if (i + 1) % 20 == 0:
+            print(f"  {i + 1}/{len(parquet_files)} files")
+    id_map = {str(i): str(pid) for i, pid in enumerate(all_ids)}
     with open(id_map_path, "w") as f:
         json.dump(id_map, f)
-    print(f"Saved {npy_path} and {id_map_path}")
+    print(f"Saved ID map: {len(id_map):,} entries")
 
-dim = embeddings.shape[1]
-params = INDEX_PARAMS[model_name][index_type] if index_type in INDEX_PARAMS.get(model_name, {}) else {}
+params = INDEX_PARAMS[model_name].get(index_type, {})
 
 # ================= BUILD INDEX =================
 index_path = os.path.join(cache_dir, f"{index_type}_index.index")
@@ -108,18 +111,24 @@ else:
         nprobe = params.get("nprobe", 128)
 
         print(f"\nBuilding IVF index with {num_centroids} centroids...")
-
         quantizer = faiss.IndexFlatIP(dim)
         index = faiss.IndexIVFFlat(quantizer, dim, num_centroids, faiss.METRIC_INNER_PRODUCT)
 
-        print("Training IVF (K-Means clustering)...")
+        print(f"Training on {TRAIN_SAMPLE_SIZE:,} sample vectors (not full collection)...")
+        train_data = load_training_sample(parquet_files, dim, TRAIN_SAMPLE_SIZE)
         start_time = time.time()
-        index.train(embeddings)
+        index.train(train_data)
+        del train_data
         print(f"Training completed in {time.time() - start_time:.2f}s")
 
-        print("Adding embeddings to index...")
+        print("Adding embeddings in batches (streaming from parquet)...")
         start_time = time.time()
-        index.add(embeddings)
+        added = 0
+        for ids, embs in iter_parquet_batches(parquet_files, dim):
+            index.add(embs)
+            added += len(embs)
+            if added % BATCH_SIZE < len(embs):
+                print(f"  Added {added:,}/{total_rows:,} vectors")
         print(f"Indexing completed in {time.time() - start_time:.2f}s")
 
         index.nprobe = nprobe
@@ -127,12 +136,16 @@ else:
 
     elif index_type == "exact":
         print(f"\nBuilding Exact (Flat) index...")
-
         index = faiss.IndexFlatIP(dim)
 
-        print("Adding embeddings to index...")
+        print("Adding embeddings in batches...")
         start_time = time.time()
-        index.add(embeddings)
+        added = 0
+        for ids, embs in iter_parquet_batches(parquet_files, dim):
+            index.add(embs)
+            added += len(embs)
+            if added % BATCH_SIZE < len(embs):
+                print(f"  Added {added:,}/{total_rows:,} vectors")
         print(f"Indexing completed in {time.time() - start_time:.2f}s")
 
     elif index_type == "hnsw":
@@ -141,13 +154,17 @@ else:
         ef_search = params.get("ef_search", 64)
 
         print(f"\nBuilding HNSW index with M={M}, ef_construction={ef_construction}...")
-
         index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
         index.hnsw.efConstruction = ef_construction
 
-        print("Adding embeddings to index (includes graph construction)...")
+        print("Adding embeddings in batches (includes graph construction)...")
         start_time = time.time()
-        index.add(embeddings)
+        added = 0
+        for ids, embs in iter_parquet_batches(parquet_files, dim):
+            index.add(embs)
+            added += len(embs)
+            if added % BATCH_SIZE < len(embs):
+                print(f"  Added {added:,}/{total_rows:,} vectors")
         print(f"Indexing completed in {time.time() - start_time:.2f}s")
 
         index.hnsw.efSearch = ef_search
@@ -157,8 +174,9 @@ else:
         print(f"Unknown index type: {index_type}. Use 'ivf', 'exact', or 'hnsw'.")
         sys.exit(1)
 
+    print(f"Saving index to {index_path}...")
     faiss.write_index(index, index_path)
-    print(f"\n{index_type.upper()} index saved to: {index_path}")
+    print("Done.")
 
 print(f"\nIndex Statistics:")
 print(f"  - Total vectors: {index.ntotal}")
