@@ -46,45 +46,31 @@ def load_parquet_embeddings(emb_dir):
         raise FileNotFoundError(f"No parquet files found in {emb_dir}")
     print(f"Found {len(parquet_files)} parquet files in {emb_dir}")
 
-    # Read first file to discover schema
+    total_rows = sum(pq.read_metadata(pf).num_rows for pf in parquet_files)
     sample = pq.read_table(parquet_files[0])
     print(f"Schema: {sample.schema}")
+    dim = len(sample.column("embedding")[0].as_py())
+    print(f"Total: {total_rows:,} passages, dim={dim}")
 
+    embeddings = np.empty((total_rows, dim), dtype="float32")
     all_ids = []
-    all_embeddings = []
+    offset = 0
+
     for i, pf in enumerate(parquet_files):
         table = pq.read_table(pf)
-        col_names = table.column_names
+        n_rows = len(table)
+        all_ids.extend(table.column("id").to_pylist())
 
-        # Auto-detect ID column
-        id_col = None
-        for candidate in ["passage_id", "docid", "doc_id", "id", "_id", "pid"]:
-            if candidate in col_names:
-                id_col = candidate
-                break
-        if id_col is None:
-            id_col = col_names[0]
+        # Arrow -> numpy directly in C, no Python object overhead
+        flat = table.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
+        embeddings[offset:offset + n_rows] = flat.reshape(n_rows, dim)
+        offset += n_rows
 
-        # Auto-detect embedding column
-        emb_col = None
-        for candidate in ["embedding", "embeddings", "vector", "emb"]:
-            if candidate in col_names:
-                emb_col = candidate
-                break
-        if emb_col is None:
-            emb_col = col_names[1]
+        if (i + 1) % 10 == 0 or (i + 1) == len(parquet_files):
+            print(f"  Loaded {i + 1}/{len(parquet_files)} files ({offset:,}/{total_rows:,} passages)")
 
-        ids = table.column(id_col).to_pylist()
-        embs = table.column(emb_col).to_pylist()
-        all_ids.extend(ids)
-        all_embeddings.extend(embs)
-
-        if (i + 1) % 20 == 0 or (i + 1) == len(parquet_files):
-            print(f"  Loaded {i + 1}/{len(parquet_files)} files ({len(all_ids)} passages so far)")
-
-    embeddings = np.array(all_embeddings, dtype="float32")
+    embeddings = embeddings[:offset]
     id_map = {str(i): str(pid) for i, pid in enumerate(all_ids)}
-    print(f"Total: {embeddings.shape[0]} embeddings, dim={embeddings.shape[1]}")
     return embeddings, id_map
 
 
