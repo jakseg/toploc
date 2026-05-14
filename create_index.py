@@ -8,14 +8,17 @@ import time
 import pyarrow.parquet as pq
 
 # ================= CONFIGURATION =================
-EMBEDDINGS_BASE = os.environ.get(
-    "EMBEDDINGS_BASE",
-    "/home/toploc2/Datasets/conversational/CAST2019",
-)
+EMBEDDINGS_BASE = "/home/toploc2/Datasets/conversational/CAST2019"
+CACHE_BASE = "/home/toploc2/Datasets/toploc2"
 
 EMBEDDING_DIRS = {
     "snowflake": os.path.join(EMBEDDINGS_BASE, "snowflake_embeddings"),
     # "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
+}
+
+CACHE_DIRS = {
+    "snowflake": os.path.join(CACHE_BASE, "snowflake"),
+    # "dragon": os.path.join(CACHE_BASE, "dragon"),
 }
 
 # Paper parameters (Table 1, Section 3 — full 38M collection)
@@ -33,6 +36,8 @@ INDEX_PARAMS = {
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 emb_dir = EMBEDDING_DIRS[model_name]
+cache_dir = CACHE_DIRS[model_name]
+os.makedirs(cache_dir, exist_ok=True)
 
 # ================= LOAD PARQUET EMBEDDINGS =================
 def load_parquet_embeddings(emb_dir):
@@ -83,8 +88,8 @@ def load_parquet_embeddings(emb_dir):
     return embeddings, id_map
 
 
-npy_path = os.path.join(emb_dir, "passage_embeddings.npy")
-id_map_path = os.path.join(emb_dir, "passage_id_map.json")
+npy_path = os.path.join(cache_dir, "passage_embeddings.npy")
+id_map_path = os.path.join(cache_dir, "passage_id_map.json")
 
 if os.path.exists(npy_path) and os.path.exists(id_map_path):
     print("Loading cached npy embeddings...")
@@ -105,7 +110,7 @@ dim = embeddings.shape[1]
 params = INDEX_PARAMS[model_name][index_type] if index_type in INDEX_PARAMS.get(model_name, {}) else {}
 
 # ================= BUILD INDEX =================
-index_path = os.path.join(emb_dir, f"{index_type}_index.index")
+index_path = os.path.join(cache_dir, f"{index_type}_index.index")
 
 if os.path.exists(index_path):
     print(f"\nIndex already exists at {index_path}, skipping build.")

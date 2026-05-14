@@ -11,23 +11,17 @@ from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
 
 # ================= CONFIGURATION =================
-EMBEDDINGS_BASE = os.environ.get(
-    "EMBEDDINGS_BASE",
-    "/home/toploc2/Datasets/conversational/CAST2019",
-)
-DATASET_DIR = os.environ.get(
-    "DATASET_DIR",
-    "/home/toploc2/Datasets/conversational/CAST2019/topics",
-)
+CACHE_BASE = "/home/toploc2/Datasets/toploc2"
+DATASET_DIR = "/home/toploc2/Datasets/conversational/CAST2019/topics"
 
-EMBEDDING_DIRS = {
-    "snowflake": os.path.join(EMBEDDINGS_BASE, "snowflake_embeddings"),
-    # "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
+CACHE_DIRS = {
+    "snowflake": os.path.join(CACHE_BASE, "snowflake"),
+    # "dragon": os.path.join(CACHE_BASE, "dragon"),
 }
 
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
-emb_dir = EMBEDDING_DIRS[model_name]
+cache_dir = CACHE_DIRS[model_name]
 
 # ================= METRIC FUNCTIONS =================
 def dcg(scores, k):
@@ -76,7 +70,7 @@ print(f"Evaluating baseline for: {model_name} ({index_type})")
 print("Loading components...")
 
 # 1. Load pre-built index (created by create_index.py)
-index_path = os.path.join(emb_dir, f"{index_type}_index.index")
+index_path = os.path.join(cache_dir, f"{index_type}_index.index")
 if not os.path.exists(index_path):
     print(f"ERROR: Index not found at {index_path}")
     print("Run create_index.py first to build it.")
@@ -94,7 +88,7 @@ elif index_type == "hnsw":
     print(f"Set efSearch={index.hnsw.efSearch}")
 
 # 2. ID Mapping
-id_map_path = os.path.join(emb_dir, "passage_id_map.json")
+id_map_path = os.path.join(cache_dir, "passage_id_map.json")
 with open(id_map_path, "r") as f:
     id_map = json.load(f)
 indexed_pids = set(id_map.values())
