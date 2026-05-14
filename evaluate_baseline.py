@@ -1,6 +1,4 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-
 import sys
 import json
 import time
@@ -12,9 +10,24 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModel
 from collections import defaultdict
 
+# ================= CONFIGURATION =================
+EMBEDDINGS_BASE = os.environ.get(
+    "EMBEDDINGS_BASE",
+    "/home/toploc2/Datasets/conversational/CAST2019",
+)
+DATASET_DIR = os.environ.get(
+    "DATASET_DIR",
+    "/home/toploc2/Datasets/conversational/CAST2019/topics",
+)
+
+EMBEDDING_DIRS = {
+    "snowflake": os.path.join(EMBEDDINGS_BASE, "snowflake_embeddings"),
+    # "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
+}
+
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
-data_dir = f"data/{model_name}"
+emb_dir = EMBEDDING_DIRS[model_name]
 
 # ================= METRIC FUNCTIONS =================
 def dcg(scores, k):
@@ -59,30 +72,38 @@ def load_query_encoder(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 # ================= LOAD DATA =================
-print(f"Evaluating baseline for: {model_name}")
+print(f"Evaluating baseline for: {model_name} ({index_type})")
 print("Loading components...")
 
-# 1. Load index (exact, ivf, or hnsw)
-index = faiss.read_index(f"{data_dir}/{index_type}_index.index")
+# 1. Load pre-built index (created by create_index.py)
+index_path = os.path.join(emb_dir, f"{index_type}_index.index")
+if not os.path.exists(index_path):
+    print(f"ERROR: Index not found at {index_path}")
+    print("Run create_index.py first to build it.")
+    sys.exit(1)
+
+index = faiss.read_index(index_path)
 print(f"{index_type.upper()} index loaded: {index.ntotal} vectors, trained={index.is_trained}")
 
-# Set search parameters depending on index type
+# Set search parameters (paper: nprobe and ef_search tested 1-4096 by powers of 2)
 if index_type == "ivf":
-    index.nprobe = 8  # Number of clusters to scan (tune later)
+    index.nprobe = 128
     print(f"Set nprobe={index.nprobe}")
 elif index_type == "hnsw":
-    index.hnsw.efSearch = 8  # Number of candidates to explore (tune later)
+    index.hnsw.efSearch = 64
     print(f"Set efSearch={index.hnsw.efSearch}")
 
 # 2. ID Mapping
-with open(f"{data_dir}/passage_id_map.json", "r") as f:
+id_map_path = os.path.join(emb_dir, "passage_id_map.json")
+with open(id_map_path, "r") as f:
     id_map = json.load(f)
 indexed_pids = set(id_map.values())
 print(f"ID map loaded: {len(id_map)} passages")
 
 # 3. Topics (Queries)
 topics = {}
-with open("dataset/topics.tsv", "r", encoding="utf-8") as f:
+topics_path = os.path.join(DATASET_DIR, "topics.tsv")
+with open(topics_path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line or line.startswith("#"): continue
@@ -92,9 +113,9 @@ with open("dataset/topics.tsv", "r", encoding="utf-8") as f:
 print(f"Topics loaded: {len(topics)} turns")
 
 # 4. QRELS (Relevance Judgments)
-# Format: qid,0,pid,relevance (e.g. 31_1,0,CAR_xxx,2)
 qrels = defaultdict(dict)
-with open("dataset/qrels.qrel", "r", encoding="utf-8") as f:
+qrels_path = os.path.join(DATASET_DIR, "qrels.qrel")
+with open(qrels_path, "r", encoding="utf-8") as f:
     for line in f:
         parts = line.strip().split(",")
         if len(parts) != 4: continue
@@ -103,7 +124,6 @@ with open("dataset/qrels.qrel", "r", encoding="utf-8") as f:
         if score > 0:
             qrels[qid][pid] = score
 
-# Filter qrels to only include passages we actually indexed
 filtered_qrels = {}
 total_turns = len(qrels)
 for turn_key, pid_scores in qrels.items():
@@ -111,8 +131,7 @@ for turn_key, pid_scores in qrels.items():
     if valid_pids:
         filtered_qrels[turn_key] = valid_pids
 
-print(f"Subset Warning: {len(filtered_qrels)}/{total_turns} turns have relevant passages in your 2k subset.")
-print("   (Metrics will be artificially low until you index the full collection)")
+print(f"Turns with relevant passages in index: {len(filtered_qrels)}/{total_turns}")
 
 # ================= EVALUATION LOOP =================
 print(f"\nLoading {model_name} query encoder...")
@@ -160,10 +179,20 @@ print(f"MRR@10:  {np.mean(mrrs):.4f}")
 print(f"Avg Time: {np.mean(times):.2f} ms")
 print("=" * 60)
 
-if model_name == "snowflake":
-    print("\nPaper Baseline Targets (Snowflake, Full Collection):")
-    print("   NDCG@10 = 0.497 | MRR@10 = 0.815 | Time = 24.9 ms")
-elif model_name == "dragon":
-    print("\nPaper Baseline Targets (Dragon, Full Collection):")
-    print("   NDCG@10 = 0.486 | MRR@10 = 0.813 | Time = 33.0 ms")
-print("Your scores will be lower due to the 2k passage subset.")
+# Paper Table 1 — TREC CAsT 2019 baselines (full collection)
+paper_targets = {
+    "snowflake": {
+        "exact": {"NDCG@10": 0.502, "MRR@10": 0.817},
+        "ivf":   {"NDCG@10": 0.497, "MRR@10": 0.815, "Time": 24.9},
+        "hnsw":  {"NDCG@10": 0.500, "MRR@10": 0.814, "Time": 1.8},
+    },
+    "dragon": {
+        "exact": {"NDCG@10": 0.492, "MRR@10": 0.799},
+        "ivf":   {"NDCG@10": 0.486, "MRR@10": 0.813, "Time": 33.0},
+        "hnsw":  {"NDCG@10": 0.469, "MRR@10": 0.789, "Time": 8.3},
+    },
+}
+if model_name in paper_targets and index_type in paper_targets[model_name]:
+    t = paper_targets[model_name][index_type]
+    parts = [f"{k} = {v}" for k, v in t.items()]
+    print(f"\nPaper targets (CAsT 2019): {' | '.join(parts)}")
