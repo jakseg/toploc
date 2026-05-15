@@ -28,14 +28,19 @@ python create_index.py <model> <index_type>
 ```
 
 - `model`: `snowflake` or `dragon`
-- `index_type`: `exact`, `ivf`, or `hnsw`
+- `index_type`: `exact`, `ivf`, `hnsw`, a comma-separated list (e.g. `exact,ivf`), or `all`
 
 Examples:
 ```bash
-python create_index.py snowflake ivf
-python create_index.py dragon hnsw
-python create_index.py snowflake exact
+python create_index.py snowflake ivf           # single index
+python create_index.py snowflake exact,ivf     # build two sequentially
+python create_index.py snowflake all           # exact + ivf + hnsw
 ```
+
+The build streams embeddings from parquet and checkpoints every 50 files
+(index + ids + checkpoint metadata). If a build is interrupted, rerunning the
+same command resumes from the last checkpoint. Per-index logs are written to
+the cache directory (e.g. `ivf_indexCreation.log`).
 
 ### 3. Evaluate
 

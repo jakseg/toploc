@@ -1,11 +1,16 @@
 import sys
 import os
+import gc
 import glob
+import random
 import faiss
 import numpy as np
 import json
 import time
+import logging
 import pyarrow.parquet as pq
+
+random.seed(42)
 
 # ================= CONFIGURATION =================
 EMBEDDINGS_BASE = "/home/toploc2/Datasets/conversational/CAST2019"
@@ -34,151 +39,194 @@ INDEX_PARAMS = {
 }
 
 TRAIN_SAMPLE_SIZE = 2_000_000
-BATCH_SIZE = 500_000
+SAVE_EVERY = 50  # checkpoint every N parquet files
 
-model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
-index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
-emb_dir = EMBEDDING_DIRS[model_name]
-cache_dir = CACHE_DIRS[model_name]
-os.makedirs(cache_dir, exist_ok=True)
+VALID_INDEX_TYPES = ("exact", "ivf", "hnsw")
+
 
 # ================= HELPERS =================
 def get_parquet_info(emb_dir):
     parquet_files = sorted(glob.glob(os.path.join(emb_dir, "*.parquet")))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found in {emb_dir}")
-    total_rows = sum(pq.read_metadata(pf).num_rows for pf in parquet_files)
     sample = pq.read_table(parquet_files[0], columns=["embedding"])
     dim = len(sample.column("embedding")[0].as_py())
-    return parquet_files, total_rows, dim
+    return parquet_files, dim
 
 
-def iter_parquet_batches(parquet_files, dim):
-    for pf in parquet_files:
-        table = pq.read_table(pf)
-        ids = table.column("id").to_pylist()
-        try:
-            flat = table.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
-            embs = flat.reshape(len(ids), dim).astype("float32")
-        except Exception:
-            embs = np.array(table.column("embedding").to_pylist(), dtype=np.float32)
-        yield ids, embs
+def read_parquet(pf, dim):
+    table = pq.read_table(pf)
+    ids = table.column("id").to_pylist()
+    try:
+        flat = table.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
+        embs = flat.reshape(len(ids), dim).astype("float32")
+    except Exception:
+        embs = np.array(table.column("embedding").to_pylist(), dtype=np.float32)
+    return ids, embs
 
 
-def load_training_sample(parquet_files, dim, n_sample):
-    collected = []
-    total = 0
-    for _, embs in iter_parquet_batches(parquet_files, dim):
-        collected.append(embs)
-        total += len(embs)
-        if total >= n_sample:
-            break
-    sample = np.concatenate(collected)[:n_sample]
-    print(f"Training sample: {len(sample):,} vectors")
-    return sample
+def setup_logger(log_path):
+    log = logging.getLogger(log_path)
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(fh)
+    log.addHandler(sh)
+    return log
 
 
-# ================= ID MAP =================
-id_map_path = os.path.join(cache_dir, "passage_id_map.json")
-parquet_files, total_rows, dim = get_parquet_info(emb_dir)
-print(f"Collection: {total_rows:,} passages, dim={dim}, {len(parquet_files)} parquet files")
+# ================= BUILD ONE INDEX =================
+def build_index(model_name, index_type, parquet_files, dim, cache_dir):
+    log_path = os.path.join(cache_dir, f"{index_type}_indexCreation.log")
+    log = setup_logger(log_path)
 
-if not os.path.exists(id_map_path):
-    print("Building passage ID map...")
+    index_path = os.path.join(cache_dir, f"{index_type}_index.index")
+    ids_path = os.path.join(cache_dir, f"{index_type}_ids.npy")
+    checkpoint_path = os.path.join(cache_dir, f"{index_type}_checkpoint.json")
+    params = INDEX_PARAMS[model_name].get(index_type, {})
+
+    # Resume or init
+    start_file = 0
     all_ids = []
-    for i, pf in enumerate(parquet_files):
-        table = pq.read_table(pf, columns=["id"])
-        all_ids.extend(table.column("id").to_pylist())
-        if (i + 1) % 20 == 0:
-            print(f"  {i + 1}/{len(parquet_files)} files")
-    id_map = {str(i): str(pid) for i, pid in enumerate(all_ids)}
-    with open(id_map_path, "w") as f:
-        json.dump(id_map, f)
-    print(f"Saved ID map: {len(id_map):,} entries")
+    index = None
 
-params = INDEX_PARAMS[model_name].get(index_type, {})
+    if os.path.exists(checkpoint_path) and os.path.exists(index_path) and os.path.exists(ids_path):
+        with open(checkpoint_path) as f:
+            ckpt = json.load(f)
+        start_file = ckpt["last_file_index"] + 1
+        all_ids = list(np.load(ids_path, allow_pickle=True))
+        index = faiss.read_index(index_path)
+        log.info(f"[{index_type}] Resuming from file {start_file}/{len(parquet_files)}, "
+                 f"index has {index.ntotal:,} vectors")
 
-# ================= BUILD INDEX =================
-index_path = os.path.join(cache_dir, f"{index_type}_index.index")
-
-if os.path.exists(index_path):
-    print(f"\nIndex already exists at {index_path}, skipping build.")
-    print("Delete it to force rebuild.")
-    index = faiss.read_index(index_path)
-else:
-    if index_type == "ivf":
-        num_centroids = params.get("num_centroids", 2**15)
-        nprobe = params.get("nprobe", 128)
-
-        print(f"\nBuilding IVF index with {num_centroids} centroids...")
-        quantizer = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIVFFlat(quantizer, dim, num_centroids, faiss.METRIC_INNER_PRODUCT)
-
-        print(f"Training on {TRAIN_SAMPLE_SIZE:,} sample vectors (not full collection)...")
-        train_data = load_training_sample(parquet_files, dim, TRAIN_SAMPLE_SIZE)
-        start_time = time.time()
-        index.train(train_data)
-        del train_data
-        print(f"Training completed in {time.time() - start_time:.2f}s")
-
-        print("Adding embeddings in batches (streaming from parquet)...")
-        start_time = time.time()
-        added = 0
-        for ids, embs in iter_parquet_batches(parquet_files, dim):
-            index.add(embs)
-            added += len(embs)
-            if added % BATCH_SIZE < len(embs):
-                print(f"  Added {added:,}/{total_rows:,} vectors")
-        print(f"Indexing completed in {time.time() - start_time:.2f}s")
-
-        index.nprobe = nprobe
-        print(f"Set nprobe={nprobe}")
-
-    elif index_type == "exact":
-        print(f"\nBuilding Exact (Flat) index...")
-        index = faiss.IndexFlatIP(dim)
-
-        print("Adding embeddings in batches...")
-        start_time = time.time()
-        added = 0
-        for ids, embs in iter_parquet_batches(parquet_files, dim):
-            index.add(embs)
-            added += len(embs)
-            if added % BATCH_SIZE < len(embs):
-                print(f"  Added {added:,}/{total_rows:,} vectors")
-        print(f"Indexing completed in {time.time() - start_time:.2f}s")
-
-    elif index_type == "hnsw":
-        M = params.get("M", 32)
-        ef_construction = params.get("ef_construction", 200)
-        ef_search = params.get("ef_search", 64)
-
-        print(f"\nBuilding HNSW index with M={M}, ef_construction={ef_construction}...")
-        index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
-        index.hnsw.efConstruction = ef_construction
-
-        print("Adding embeddings in batches (includes graph construction)...")
-        start_time = time.time()
-        added = 0
-        for ids, embs in iter_parquet_batches(parquet_files, dim):
-            index.add(embs)
-            added += len(embs)
-            if added % BATCH_SIZE < len(embs):
-                print(f"  Added {added:,}/{total_rows:,} vectors")
-        print(f"Indexing completed in {time.time() - start_time:.2f}s")
-
-        index.hnsw.efSearch = ef_search
-        print(f"Set efSearch={ef_search}")
+    elif os.path.exists(index_path) and not os.path.exists(checkpoint_path):
+        log.info(f"[{index_type}] Final index already exists at {index_path}, skipping.")
+        index = faiss.read_index(index_path)
+        log.info(f"[{index_type}] Stats: ntotal={index.ntotal:,}, trained={index.is_trained}")
+        return
 
     else:
-        print(f"Unknown index type: {index_type}. Use 'ivf', 'exact', or 'hnsw'.")
-        sys.exit(1)
+        if index_type == "ivf":
+            num_centroids = params.get("num_centroids", 2**15)
+            log.info(f"[ivf] Building with {num_centroids} centroids...")
+            quantizer = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIVFFlat(quantizer, dim, num_centroids, faiss.METRIC_INNER_PRODUCT)
 
-    print(f"Saving index to {index_path}...")
+            log.info(f"[ivf] Collecting training sample (target {TRAIN_SAMPLE_SIZE:,} vectors)...")
+            shuffled = list(parquet_files)
+            random.shuffle(shuffled)
+            train_chunks = []
+            collected = 0
+            for pf in shuffled:
+                _, embs = read_parquet(pf, dim)
+                faiss.normalize_L2(embs)
+                train_chunks.append(embs)
+                collected += len(embs)
+                if collected >= TRAIN_SAMPLE_SIZE:
+                    break
+            train_data = np.concatenate(train_chunks)[:TRAIN_SAMPLE_SIZE]
+            del train_chunks
+            log.info(f"[ivf] Training on {len(train_data):,} vectors "
+                     f"(FAISS needs >= {39 * num_centroids:,})...")
+            t0 = time.time()
+            index.train(train_data)
+            del train_data
+            gc.collect()
+            log.info(f"[ivf] Training completed in {time.time() - t0:.2f}s")
+
+        elif index_type == "exact":
+            log.info("[exact] Building IndexFlatIP...")
+            index = faiss.IndexFlatIP(dim)
+
+        elif index_type == "hnsw":
+            M = params.get("M", 32)
+            ef_construction = params.get("ef_construction", 200)
+            log.info(f"[hnsw] Building with M={M}, ef_construction={ef_construction}...")
+            index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
+            index.hnsw.efConstruction = ef_construction
+
+        else:
+            log.error(f"Unknown index type: {index_type}")
+            return
+
+    # Add loop with checkpointing
+    log.info(f"[{index_type}] Adding embeddings (streaming from parquet)...")
+    t0 = time.time()
+    for i in range(start_file, len(parquet_files)):
+        pf = parquet_files[i]
+        try:
+            ids, embs = read_parquet(pf, dim)
+            faiss.normalize_L2(embs)
+            index.add(embs)
+            all_ids.extend(ids)
+        except Exception as e:
+            log.error(f"[{index_type}] [{i + 1}/{len(parquet_files)}] "
+                      f"Failed on {os.path.basename(pf)}: {e}")
+            continue
+
+        if (i + 1) % 10 == 0:
+            log.info(f"[{index_type}] [{i + 1}/{len(parquet_files)}] "
+                     f"Indexed: {index.ntotal:,} vectors")
+
+        if (i + 1) % SAVE_EVERY == 0:
+            log.info(f"[{index_type}] Saving checkpoint at file {i + 1}...")
+            faiss.write_index(index, index_path)
+            np.save(ids_path, np.array(all_ids, dtype=object))
+            with open(checkpoint_path, "w") as f:
+                json.dump({"last_file_index": i, "ntotal": index.ntotal}, f)
+            log.info(f"[{index_type}] Checkpoint saved ({index.ntotal:,} vectors).")
+
+    log.info(f"[{index_type}] Add loop completed in {time.time() - t0:.2f}s")
+
+    # Set search-time params
+    if index_type == "ivf":
+        index.nprobe = params.get("nprobe", 128)
+        log.info(f"[ivf] Set nprobe={index.nprobe}")
+    elif index_type == "hnsw":
+        index.hnsw.efSearch = params.get("ef_search", 64)
+        log.info(f"[hnsw] Set efSearch={index.hnsw.efSearch}")
+
+    # Final save
+    log.info(f"[{index_type}] Saving final index and IDs...")
     faiss.write_index(index, index_path)
-    print("Done.")
+    np.save(ids_path, np.array(all_ids, dtype=object))
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    log.info(f"[{index_type}] Done. Total vectors: {index.ntotal:,}")
+    log.info(f"[{index_type}] Index:  {index_path}")
+    log.info(f"[{index_type}] IDs:    {ids_path}")
 
-print(f"\nIndex Statistics:")
-print(f"  - Total vectors: {index.ntotal}")
-print(f"  - Dimension: {dim}")
-print(f"  - Is trained: {index.is_trained}")
+
+# ================= MAIN =================
+model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
+type_arg = sys.argv[2] if len(sys.argv) > 2 else "ivf"
+
+if type_arg == "all":
+    index_types = list(VALID_INDEX_TYPES)
+else:
+    index_types = [t.strip() for t in type_arg.split(",")]
+    for t in index_types:
+        if t not in VALID_INDEX_TYPES:
+            print(f"Unknown index type: {t}. Use one of {VALID_INDEX_TYPES} or 'all'.")
+            sys.exit(1)
+
+emb_dir = EMBEDDING_DIRS[model_name]
+cache_dir = CACHE_DIRS[model_name]
+os.makedirs(cache_dir, exist_ok=True)
+
+parquet_files, dim = get_parquet_info(emb_dir)
+print(f"Model: {model_name} | Types: {index_types} | "
+      f"{len(parquet_files)} parquet files, dim={dim}")
+
+for it in index_types:
+    print(f"\n{'=' * 60}\nBuilding: {it}\n{'=' * 60}")
+    t0 = time.time()
+    build_index(model_name, it, parquet_files, dim, cache_dir)
+    print(f"[{it}] total wall time: {(time.time() - t0) / 60:.1f} min")
+    gc.collect()
+
+print("\nAll requested index types complete.")

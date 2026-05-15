@@ -87,10 +87,10 @@ elif index_type == "hnsw":
     index.hnsw.efSearch = 64
     print(f"Set efSearch={index.hnsw.efSearch}")
 
-# 2. ID Mapping
-id_map_path = os.path.join(cache_dir, "passage_id_map.json")
-with open(id_map_path, "r") as f:
-    id_map = json.load(f)
+# 2. ID Mapping (built inline with the index by create_index.py)
+ids_path = os.path.join(cache_dir, f"{index_type}_ids.npy")
+id_array = np.load(ids_path, allow_pickle=True)
+id_map = {str(i): str(pid) for i, pid in enumerate(id_array)}
 indexed_pids = set(id_map.values())
 print(f"ID map loaded: {len(id_map)} passages")
 
@@ -101,7 +101,7 @@ with open(topics_path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line or line.startswith("#"): continue
-        parts = line.split("\t", 1)
+        parts = line.split(",", 1)
         if len(parts) == 2:
             topics[parts[0].strip()] = parts[1].strip()
 print(f"Topics loaded: {len(topics)} turns")
