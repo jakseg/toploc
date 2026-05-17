@@ -48,7 +48,12 @@ def load_query_encoder(model_name):
     if model_name == "snowflake":
         model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
         def encode(query):
-            return model.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
+            return model.encode(
+                [query],
+                prompt_name="query",
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            ).astype("float32")
         return encode
     elif model_name == "dragon":
         tokenizer = AutoTokenizer.from_pretrained("facebook/dragon-plus-query-encoder")
