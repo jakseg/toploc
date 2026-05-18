@@ -3,4 +3,5 @@ sentence-transformers
 faiss-cpu
 torch
 huggingface_hub
-faiss-cpu
+matplotlib
+seaborn
