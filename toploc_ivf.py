@@ -1,3 +1,15 @@
+import os
+import sys
+import json
+import time
+import math
+import numpy as np
+import faiss
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel
+from collections import defaultdict
+
 # ================= CONFIGURATION =================
 # Use environment variables for portability
 
@@ -18,6 +30,7 @@ NP = 8
 # Standardize threading for reproducible latency measurements
 # faiss.omp_set_num_threads(1)
 # commented for now
+
 
 # ================= METRIC FUNCTIONS =================
 def dcg(scores, k):
