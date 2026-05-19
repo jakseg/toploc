@@ -27,7 +27,8 @@ NP = 8  # nprobe
 ALPHA = 0.1  # α ∈ {0.0, 0.05, 0.1, 0.2}
 
 # Standardize threading for reproducible latency measurements
-faiss.omp_set_num_threads(1)
+# faiss.omp_set_num_threads(1)
+# commented for now
 
 
 # ================= METRIC FUNCTIONS =================

@@ -16,8 +16,8 @@ H_CACHED_CENTROIDS = 1024
 NP = 8
 
 # Standardize threading for reproducible latency measurements
-faiss.omp_set_num_threads(1)
-
+# faiss.omp_set_num_threads(1)
+# commented for now
 
 # ================= METRIC FUNCTIONS =================
 def dcg(scores, k):
