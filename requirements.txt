@@ -5,3 +5,4 @@ torch
 huggingface_hub
 matplotlib
 seaborn
+ir_measures
