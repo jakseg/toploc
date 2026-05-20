@@ -46,7 +46,7 @@ cache_dir = CACHE_DIRS[model_name]
 # Number of "hot" centroids cached after turn 0 (paper tests {512,1024,4096,8192})
 H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))
 # nprobe used for every search (paper sweeps powers of 2)
-NP = int(os.environ.get("NP", 8))
+NP = int(os.environ.get("NP", 128))
 
 # Set MMAP=1 to avoid loading the whole index into RAM (fixes "Killed").
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
