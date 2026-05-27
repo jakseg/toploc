@@ -27,6 +27,7 @@ import math
 import numpy as np
 import faiss
 from collections import defaultdict
+from toploc_search import toploc_ivf_search  # ← C++ version, same name
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
@@ -124,61 +125,61 @@ def load_query_encoder(model_name):
 
 
 # ================= TOPLOC IVF HELPERS =================
-def get_centroid_vectors(quantizer, centroid_indices):
-    """Fetch centroid vectors from the IVF quantizer, batched."""
-    idx = np.asarray(centroid_indices, dtype="int64")
-    try:
-        # Batched reconstruction: one call instead of len(idx) Python calls.
-        return quantizer.reconstruct_batch(idx).astype("float32")
-    except (AttributeError, RuntimeError):
-        # Fallback for older FAISS builds without reconstruct_batch.
-        d = quantizer.d
-        vecs = np.empty((len(idx), d), dtype="float32")
-        for local_i, global_i in enumerate(idx):
-            vecs[local_i] = quantizer.reconstruct(int(global_i))
-        return vecs
+# def get_centroid_vectors(quantizer, centroid_indices):
+#     """Fetch centroid vectors from the IVF quantizer, batched."""
+#     idx = np.asarray(centroid_indices, dtype="int64")
+#     try:
+#         # Batched reconstruction: one call instead of len(idx) Python calls.
+#         return quantizer.reconstruct_batch(idx).astype("float32")
+#     except (AttributeError, RuntimeError):
+#         # Fallback for older FAISS builds without reconstruct_batch.
+#         d = quantizer.d
+#         vecs = np.empty((len(idx), d), dtype="float32")
+#         for local_i, global_i in enumerate(idx):
+#             vecs[local_i] = quantizer.reconstruct(int(global_i))
+#         return vecs
 
 
-def toploc_ivf_search(index, q_emb, cached_centroid_indices, nprobe, k):
-    """Restrict the IVF search to the cached "hot" centroids.
+# def toploc_ivf_search(index, q_emb, cached_centroid_indices, nprobe, k):
+#     """Restrict the IVF search to the cached "hot" centroids.
 
-    We re-rank the cached centroids for the *current* query, pick the top-nprobe
-    of them, and hand those directly to search_preassigned so FAISS scans only
-    those inverted lists -- never touching the full centroid set.
-    """
-    centroid_vecs = get_centroid_vectors(index.quantizer, cached_centroid_indices)
+#     We re-rank the cached centroids for the *current* query, pick the top-nprobe
+#     of them, and hand those directly to search_preassigned so FAISS scans only
+#     those inverted lists -- never touching the full centroid set.
+#     """
+#     centroid_vecs = get_centroid_vectors(index.quantizer, cached_centroid_indices)
 
-    use_ip = index.metric_type == faiss.METRIC_INNER_PRODUCT
+#     use_ip = index.metric_type == faiss.METRIC_INNER_PRODUCT
 
-    if use_ip:
-        # Higher inner product = closer.
-        coarse = (centroid_vecs @ q_emb.T).squeeze(axis=1)
-        top_local = np.argpartition(-coarse, min(nprobe, len(coarse) - 1))[:nprobe]
-        top_local = top_local[np.argsort(-coarse[top_local])]
-    else:
-        # Smaller L2 distance = closer.
-        coarse = ((centroid_vecs - q_emb) ** 2).sum(axis=1)
-        top_local = np.argpartition(coarse, min(nprobe, len(coarse) - 1))[:nprobe]
-        top_local = top_local[np.argsort(coarse[top_local])]
+#     if use_ip:
+#         # Higher inner product = closer.
+#         coarse = (centroid_vecs @ q_emb.T).squeeze(axis=1)
+#         top_local = np.argpartition(-coarse, min(nprobe, len(coarse) - 1))[:nprobe]
+#         top_local = top_local[np.argsort(-coarse[top_local])]
+#     else:
+#         # Smaller L2 distance = closer.
+#         coarse = ((centroid_vecs - q_emb) ** 2).sum(axis=1)
+#         top_local = np.argpartition(coarse, min(nprobe, len(coarse) - 1))[:nprobe]
+#         top_local = top_local[np.argsort(coarse[top_local])]
 
-    sel_centroids = (
-        np.asarray(cached_centroid_indices)[top_local].astype("int64").reshape(1, -1)
-    )
-    # search_preassigned wants the coarse distances for those centroids too.
-    sel_coarse = coarse[top_local].astype("float32").reshape(1, -1)
+#     sel_centroids = (
+#         np.asarray(cached_centroid_indices)[top_local].astype("int64").reshape(1, -1)
+#     )
+#     # search_preassigned wants the coarse distances for those centroids too.
+#     sel_coarse = coarse[top_local].astype("float32").reshape(1, -1)
 
-    try:
-        scores, indices = index.search_preassigned(q_emb, k, sel_centroids, sel_coarse)
-    except TypeError:
-        # Some FAISS versions accept (x, k, assign) without coarse distances.
-        scores, indices = index.search_preassigned(q_emb, k, sel_centroids)
-    except AttributeError:
-        raise RuntimeError(
-            "search_preassigned is not available in your FAISS build. "
-            "Upgrade to faiss-cpu>=1.7.3 to run TopLoc-IVF correctly."
-        )
+#     try:
+#         scores, indices = index.search_preassigned(q_emb, k, sel_centroids, sel_coarse)
+#     except TypeError:
+#         # Some FAISS versions accept (x, k, assign) without coarse distances.
+#         scores, indices = index.search_preassigned(q_emb, k, sel_centroids)
+#     except AttributeError:
+#         raise RuntimeError(
+#             "search_preassigned is not available in your FAISS build. "
+#             "Upgrade to faiss-cpu>=1.7.3 to run TopLoc-IVF correctly."
+#         )
 
-    return scores, indices
+#     return scores, indices
 
 
 # ================= FLEXIBLE PARSERS =================
@@ -329,11 +330,15 @@ for conv_id, turns in conversations.items():
     for turn_key in turns[1:]:
         if turn_key not in filtered_qrels:
             continue
+
         q_emb = encode_query(topics[turn_key])
+
         start = time.perf_counter()
+
         scores, indices = toploc_ivf_search(
             ivf_index, q_emb, conv_cache[conv_id], NP, k
         )
+
         end = time.perf_counter()
 
         if evaluated_turns >= warmup:
