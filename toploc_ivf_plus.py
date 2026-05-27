@@ -12,8 +12,8 @@ When |I0| falls below alpha * np, a refresh is triggered: C0 is recomputed from
 the current utterance and that utterance becomes the new reference q0.
 
 Run:
-    python3 toploc_ivf_plus_eval.py snowflake ivf
-    python3 toploc_ivf_plus_eval.py dragon    ivf
+    python3 toploc_ivf_plus.py snowflake ivf
+    python3 toploc_ivf_plus.py dragon    ivf
 
 Env vars:
     CACHE_BASE   base dir holding <model>/<index>_index.index and _ids.npy
@@ -27,10 +27,12 @@ Env vars:
 import os
 import sys
 import time
-import math
 import numpy as np
 import faiss
 from collections import defaultdict
+import ir_measures
+from ir_measures import nDCG, RR
+from toploc_search import toploc_ivf_search  # ← C++ version
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
@@ -57,24 +59,10 @@ USE_MMAP = os.environ.get("MMAP", "0") == "1"
 # faiss.omp_set_num_threads(1)  # uncomment for single-threaded reproducible timing
 
 
-# ================= METRIC FUNCTIONS =================
-def dcg(scores, k):
-    return sum(s / math.log2(i + 2) for i, s in enumerate(scores[:k]))
-
-
-def ndcg(retrieved_ids, qrel_dict, k=10):
-    rel_scores = [qrel_dict.get(pid, 0) for pid in retrieved_ids[:k]]
-    ideal_scores = sorted(qrel_dict.values(), reverse=True)[:k]
-    if not ideal_scores or max(ideal_scores) == 0:
-        return 0.0
-    return dcg(rel_scores, k) / dcg(ideal_scores, k)
-
-
-def mrr(retrieved_ids, qrel_dict, k=10):
-    for rank, pid in enumerate(retrieved_ids[:k], 1):
-        if qrel_dict.get(pid, 0) > 0:
-            return 1.0 / rank
-    return 0.0
+# ================= REMOVED =================
+# dcg()  — deleted, ir_measures handles this
+# ndcg() — deleted, ir_measures handles this
+# mrr()  — deleted, ir_measures handles this
 
 
 # ================= QUERY ENCODER =================
@@ -122,9 +110,12 @@ def load_query_encoder(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 
-# ================= TOPLOC IVF HELPERS =================
+# ================= TOPLOC IVF+ HELPERS =================
 def get_centroid_vectors(quantizer, centroid_indices):
-    """Fetch centroid vectors from the IVF quantizer, batched."""
+    """Fetch centroid vectors from the IVF quantizer, batched.
+    Still needed in IVF+ for the I0 drift check (rank_within_cache).
+    NOT needed in plain IVF — the C++ function handles it there.
+    """
     idx = np.asarray(centroid_indices, dtype="int64")
     try:
         return quantizer.reconstruct_batch(idx).astype("float32")
@@ -138,7 +129,9 @@ def get_centroid_vectors(quantizer, centroid_indices):
 
 def rank_within_cache(centroid_vecs, q_emb, nprobe, use_ip):
     """Return the local indices of the top-nprobe cached centroids for q_emb,
-    plus the coarse scores for ALL cached centroids (reused by the I0 proxy)."""
+    plus the coarse scores for ALL cached centroids (reused by the I0 proxy).
+    This is Python-only and only used for the drift check — NOT for the search.
+    """
     if use_ip:
         coarse = (centroid_vecs @ q_emb.T).reshape(-1)  # higher = closer
         order = np.argsort(-coarse)
@@ -148,29 +141,12 @@ def rank_within_cache(centroid_vecs, q_emb, nprobe, use_ip):
     return order[:nprobe], coarse
 
 
-def toploc_ivf_search(
-    index, q_emb, cached_centroid_indices, centroid_vecs, top_local, coarse, k, use_ip
-):
-    """Restricted IVF search over the cached centroids.
-
-    centroid_vecs / top_local / coarse are passed in so we don't reconstruct or
-    re-rank the cache twice (the IVF+ refresh check already did that work).
-    """
-    sel_centroids = (
-        np.asarray(cached_centroid_indices)[top_local].astype("int64").reshape(1, -1)
-    )
-    sel_coarse = coarse[top_local].astype("float32").reshape(1, -1)
-
-    try:
-        scores, indices = index.search_preassigned(q_emb, k, sel_centroids, sel_coarse)
-    except TypeError:
-        scores, indices = index.search_preassigned(q_emb, k, sel_centroids)
-    except AttributeError:
-        raise RuntimeError(
-            "search_preassigned is not available in your FAISS build. "
-            "Upgrade to faiss-cpu>=1.7.3 to run TopLoc-IVF correctly."
-        )
-    return scores, indices
+# ================= REMOVED =================
+# toploc_ivf_search() Python version — deleted.
+# Replaced by the C++ version imported from toploc_search.
+# Note: C++ version signature is:
+#   toploc_ivf_search(index, q_emb, cached_ids, nprobe, k)
+# It handles centroid fetching + scoring + search_preassigned internally.
 
 
 # ================= FLEXIBLE PARSERS =================
@@ -187,7 +163,7 @@ def split_flexible(line, expected):
     return None
 
 
-# ================= LOAD INDEX (memory-safe) =================
+# ================= LOAD INDEX =================
 print(f"Evaluating TopLoc-IVF+ for: {model_name} ({index_type})")
 index_path = os.path.join(cache_dir, f"{index_type}_index.index")
 
@@ -275,12 +251,14 @@ print(f"\nLoading {model_name} query encoder...")
 encode_query = load_query_encoder(model_name)
 print(f"Running TopLoc-IVF+ evaluation (h={H}, alpha={ALPHA}, np={NP})...")
 
-# conv_cache[conv_id] = {"c0": int64 array, "q0_emb": float32 (1,d)}
 conv_cache = {}
 k, warmup = 10, 5
-times, ndcgs, mrrs = [], [], []
+times = []
 evaluated_turns = 0
 refresh_count = 0
+
+# collect results for ir_measures — same pattern as baseline
+run = defaultdict(dict)
 
 for conv_id, turns in conversations.items():
     q0_key = turns[0]
@@ -291,72 +269,103 @@ for conv_id, turns in conversations.items():
     q0_emb = encode_query(topics[q0_key])
     start = time.perf_counter()
     _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
-    conv_cache[conv_id] = {"c0": c0_indices[0].astype("int64"), "q0_emb": q0_emb}
+
+    # compute once and store — never recompute until refresh
+    c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_indices[0])
+    top_0_local, _ = rank_within_cache(c0_vecs, q0_emb, NP, USE_IP)
+
+    conv_cache[conv_id] = {
+        "c0": c0_indices[0].astype("int64"),
+        "q0_emb": q0_emb,
+        "c0_vecs": c0_vecs,  # saved — no recompute per turn
+        "top_0_local": top_0_local,  # saved — no recompute per turn
+    }
+
     scores, indices = base_index.search(q0_emb, k)
     end = time.perf_counter()
 
     if evaluated_turns >= warmup:
         times.append((end - start) * 1000)
-    retrieved_ids = [id_map.get(str(idx)) for idx in indices[0] if id_map.get(str(idx))]
-    ndcgs.append(ndcg(retrieved_ids, filtered_qrels[q0_key], k))
-    mrrs.append(mrr(retrieved_ids, filtered_qrels[q0_key], k))
+
+    # build run dict for ir_measures
+    for idx, score in zip(indices[0], scores[0]):
+        if idx < 0:
+            continue
+        pid = id_map.get(str(idx))
+        if pid is not None:
+            run[q0_key][pid] = float(score)
+
     evaluated_turns += 1
 
-    # ---- TURNS 1+: I0 proxy -> conditional refresh -> restricted search ----
+    # ---- TURNS 1+: I0 proxy -> conditional refresh -> C++ restricted search ----
     for turn_key in turns[1:]:
         if turn_key not in filtered_qrels:
             continue
-        qj_emb = encode_query(topics[turn_key])
 
+        qj_emb = encode_query(topics[turn_key])
         start = time.perf_counter()
         cache = conv_cache[conv_id]
 
-        # Reconstruct + rank the cached centroids ONCE for this query.
-        c0_vecs = get_centroid_vectors(ivf_index.quantizer, cache["c0"])
-        top_j_local, coarse_j = rank_within_cache(c0_vecs, qj_emb, NP, USE_IP)
+        # read from cache — no recomputing
+        c0_vecs = cache["c0_vecs"]
+        top_0_local = cache["top_0_local"]
 
-        # I0 proxy: overlap between top-np for qj and top-np for q0, within C0.
-        top_0_local, _ = rank_within_cache(c0_vecs, cache["q0_emb"], NP, USE_IP)
+        # only qj needs computing — it's new every turn
+        top_j_local, _ = rank_within_cache(c0_vecs, qj_emb, NP, USE_IP)
+
+        # I0 proxy: overlap between top-np for qj and top-np for q0 within C0
         i0_size = len(np.intersect1d(top_j_local, top_0_local))
 
-        # Refresh when the conversation has drifted (overlap too small).
+        # refresh when conversation has drifted
         if i0_size < ALPHA * NP:
             _, new_c0 = ivf_index.quantizer.search(qj_emb, H)
-            cache = {"c0": new_c0[0].astype("int64"), "q0_emb": qj_emb}
+            new_c0_vecs = get_centroid_vectors(ivf_index.quantizer, new_c0[0])
+            new_top_0, _ = rank_within_cache(new_c0_vecs, qj_emb, NP, USE_IP)
+
+            cache = {
+                "c0": new_c0[0].astype("int64"),
+                "q0_emb": qj_emb,
+                "c0_vecs": new_c0_vecs,  # saved for future turns
+                "top_0_local": new_top_0,  # saved for future turns
+            }
             conv_cache[conv_id] = cache
             refresh_count += 1
-            # Re-rank against the freshly cached centroids.
-            c0_vecs = get_centroid_vectors(ivf_index.quantizer, cache["c0"])
-            top_j_local, coarse_j = rank_within_cache(c0_vecs, qj_emb, NP, USE_IP)
 
+        # C++ does centroid fetch + scoring + search_preassigned in one shot
         scores, indices = toploc_ivf_search(
             ivf_index,
             qj_emb,
             cache["c0"],
-            c0_vecs,
-            top_j_local,
-            coarse_j,
+            NP,
             k,
-            USE_IP,
         )
         end = time.perf_counter()
 
         if evaluated_turns >= warmup:
             times.append((end - start) * 1000)
-        retrieved_ids = [
-            id_map.get(str(idx)) for idx in indices[0] if id_map.get(str(idx))
-        ]
-        ndcgs.append(ndcg(retrieved_ids, filtered_qrels[turn_key], k))
-        mrrs.append(mrr(retrieved_ids, filtered_qrels[turn_key], k))
+
+        # build run dict for ir_measures
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < 0:
+                continue
+            pid = id_map.get(str(idx))
+            if pid is not None:
+                run[turn_key][pid] = float(score)
+
         evaluated_turns += 1
+
+# ================= COMPUTE METRICS WITH ir_measures =================
+measures = [nDCG @ 3, nDCG @ k, RR @ k]
+results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
 # ================= RESULTS =================
 print("\n" + "=" * 60)
 print(f"TOPLOC-IVF+ EVALUATION RESULTS ({index_type.upper()}, {model_name})")
 print("=" * 60)
 print(f"Turns evaluated:           {evaluated_turns}")
-print(f"NDCG@10:                   {np.mean(ndcgs) if ndcgs else float('nan'):.4f}")
-print(f"MRR@10:                    {np.mean(mrrs) if mrrs else float('nan'):.4f}")
+print(f"NDCG@3:                    {results[nDCG @ 3]:.4f}")
+print(f"NDCG@10:                   {results[nDCG @ k]:.4f}")
+print(f"MRR@10:                    {results[RR @ k]:.4f}")
 print(f"Avg Time:                  {np.mean(times) if times else float('nan'):.2f} ms")
 print(f"Centroids cached per conv: {H}")
 print(f"nprobe:                    {NP}")
