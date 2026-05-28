@@ -25,7 +25,7 @@ index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 cache_dir = CACHE_DIRS[model_name]
 
 H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))
-NP = int(os.environ.get("NP", 128))
+NP = int(os.environ.get("NP", 32))
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 
 
