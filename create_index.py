@@ -18,12 +18,12 @@ CACHE_BASE = "/home/toploc2/Datasets/toploc2"
 
 EMBEDDING_DIRS = {
     "snowflake": os.path.join(EMBEDDINGS_BASE, "snowflake_embeddings"),
-    # "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
+    "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
 }
 
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
-    # "dragon": os.path.join(CACHE_BASE, "dragon"),
+    "dragon": os.path.join(CACHE_BASE, "dragon"),
 }
 
 # Paper parameters (Table 1, Section 3 — full 38M collection)

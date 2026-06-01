@@ -16,7 +16,7 @@ DATASET_DIR = "/home/toploc2/Datasets/conversational/CAST2019/topics"
 
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
-    # "dragon": os.path.join(CACHE_BASE, "dragon"),
+    "dragon": os.path.join(CACHE_BASE, "dragon"),
 }
 
 # Latency benchmarking config
@@ -71,6 +71,46 @@ def load_query_encoder(model_name):
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
+
+
+# ================= PRECOMPUTED QUERY EMBEDDINGS (optional) =================
+def load_precomputed_query_embeddings(model_name, keys):
+    """Try to load precomputed query embeddings for `keys` (turn IDs) from
+    topics_<model>_embeddings.parquet in DATASET_DIR.
+
+    Returns an (N, dim) float32 matrix aligned to `keys` on full success,
+    otherwise None (caller falls back to on-the-fly encoding).
+    """
+    import pyarrow.parquet as pq
+
+    emb_path = os.path.join(DATASET_DIR, f"topics_{model_name}_embeddings.parquet")
+    if not os.path.exists(emb_path):
+        return None
+
+    table = pq.read_table(emb_path)
+    cols = table.column_names
+    id_col = next((c for c in ("id", "qid", "turn_id", "topic_id", "tid") if c in cols), None)
+    emb_col = next((c for c in ("embedding", "embeddings", "vector", "emb") if c in cols), None)
+    if id_col is None or emb_col is None:
+        print(f"  WARN: {os.path.basename(emb_path)} has columns {cols}; "
+              f"could not find id/embedding columns — encoding instead.")
+        return None
+
+    emb_map = {str(i): e for i, e in zip(
+        table.column(id_col).to_pylist(), table.column(emb_col).to_pylist())}
+    missing = [k for k in keys if k not in emb_map]
+    if missing:
+        print(f"  WARN: {len(missing)}/{len(keys)} eval turns missing from "
+              f"{os.path.basename(emb_path)} (e.g. {missing[:3]}) — encoding instead.")
+        return None
+
+    matrix = np.ascontiguousarray([emb_map[k] for k in keys], dtype="float32")
+    # Index is inner-product over L2-normalized document vectors, so normalize
+    # queries too (idempotent if they are already normalized).
+    faiss.normalize_L2(matrix)
+    print(f"  Loaded precomputed query embeddings {matrix.shape} "
+          f"from {os.path.basename(emb_path)}")
+    return matrix
 
 
 # ================= LOAD DATA =================
@@ -154,15 +194,19 @@ eval_keys = [k for k in topics if k in filtered_qrels]
 eval_queries = [topics[k] for k in eval_keys]
 N = len(eval_queries)
 
-# ================= ENCODE ALL QUERIES (BATCH) =================
-print(f"Loading {model_name} query encoder...")
-encode_batch = load_query_encoder(model_name)
-print(f"Batch-encoding {N} queries...")
-t0 = time.perf_counter()
-query_matrix = encode_batch(eval_queries)
-enc_ms = (time.perf_counter() - t0) * 1000
-print(f"Query encoding done in {enc_ms:.1f} ms total "
-      f"({enc_ms / N:.2f} ms/query) — shape={query_matrix.shape}")
+# ================= OBTAIN QUERY EMBEDDINGS =================
+# Prefer precomputed topic embeddings if available; otherwise encode on the fly.
+print(f"\nObtaining query embeddings for {N} queries...")
+query_matrix = load_precomputed_query_embeddings(model_name, eval_keys)
+if query_matrix is None:
+    print(f"Loading {model_name} query encoder...")
+    encode_batch = load_query_encoder(model_name)
+    print(f"Batch-encoding {N} queries...")
+    t0 = time.perf_counter()
+    query_matrix = encode_batch(eval_queries)
+    enc_ms = (time.perf_counter() - t0) * 1000
+    print(f"Query encoding done in {enc_ms:.1f} ms total "
+          f"({enc_ms / N:.2f} ms/query) — shape={query_matrix.shape}")
 
 # Group the encoded eval rows by conversation, preserving topics order.
 conv_rows = defaultdict(list)
