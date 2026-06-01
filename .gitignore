@@ -10,6 +10,9 @@ __pycache__/
 *.mmap
 *.bin
 
+# Generated demo artifacts (rebuilt by demo/build_demo_subset.py)
+demo/data/
+
 # Model cache
 .cache/
 
