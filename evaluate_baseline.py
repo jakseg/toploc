@@ -143,10 +143,16 @@ for turn_key, pid_scores in qrels.items():
 print(f"Turns with relevant passages in index: {len(filtered_qrels)}/{total_turns}")
 
 # ================= COLLECT EVAL QUERIES IN STABLE ORDER =================
+# Turn keys look like "<conv_id>_<turn>". We mirror the TopLoc evaluation by
+# processing one conversation at a time: the first (judged) turn q0 is searched
+# alone, and the remaining turns of that conversation are searched as one batch.
+# This matches how TopLoc must work — its per-conversation cache is built on q0
+# and reused by the follow-ups, so a single FAISS batch cannot span queries from
+# different conversations. Using the same per-conversation granularity here keeps
+# the baseline vs TopLoc latency comparison fair.
 eval_keys = [k for k in topics if k in filtered_qrels]
 eval_queries = [topics[k] for k in eval_keys]
 N = len(eval_queries)
-print(f"\nEval set: {N} turns")
 
 # ================= ENCODE ALL QUERIES (BATCH) =================
 print(f"Loading {model_name} query encoder...")
@@ -158,57 +164,106 @@ enc_ms = (time.perf_counter() - t0) * 1000
 print(f"Query encoding done in {enc_ms:.1f} ms total "
       f"({enc_ms / N:.2f} ms/query) — shape={query_matrix.shape}")
 
-# ================= BATCH SEARCH WITH WARMUP + REPEATED RUNS =================
+# Group the encoded eval rows by conversation, preserving topics order.
+conv_rows = defaultdict(list)
+for row, key in enumerate(eval_keys):
+    conv_rows[key.split("_")[0]].append(row)
+
+first_rows = [rows[0] for rows in conv_rows.values()]          # one q0 per conversation
+followup_rows_per_conv = [rows[1:] for rows in conv_rows.values()]
+first_n = len(first_rows)
+followup_n = sum(len(r) for r in followup_rows_per_conv)
+print(f"\nEval set: {N} turns "
+      f"({first_n} first-turn, {followup_n} follow-up) "
+      f"across {len(conv_rows)} conversations")
+
 k = 10
-print(f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed batch searches...")
 
-# Warmup runs (not timed, let caches and any JIT settle)
-for _ in range(BATCH_WARMUP_RUNS):
-    _ = index.search(query_matrix, k)
-
-# Timed runs
-batch_times_ms = []
-last_scores, last_indices = None, None
-for run_i in range(BATCH_TIMED_RUNS):
-    t0 = time.perf_counter()
-    last_scores, last_indices = index.search(query_matrix, k)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    batch_times_ms.append(elapsed_ms)
-    print(f"  run {run_i + 1}: batch={elapsed_ms:.2f} ms  "
-          f"per-query={elapsed_ms / N:.3f} ms")
-
-batch_ms_min = min(batch_times_ms)
-batch_ms_median = float(np.median(batch_times_ms))
-batch_ms_mean = float(np.mean(batch_times_ms))
-
-# ================= BUILD RUN FROM BATCH RESULTS =================
+# ================= BUILD RUN (correctness, untimed) =================
+# Retrieval results are independent of how queries are batched, so we run all
+# eval queries once (untimed) and build the run dict from that. Latency is
+# measured separately below. This mirrors the single/batch split used in
+# toploc_ivf_batched_all.py (results vs timing).
 run = defaultdict(dict)
+all_scores, all_indices = index.search(query_matrix, k)
 for row, turn_key in enumerate(eval_keys):
-    for idx, score in zip(last_indices[row], last_scores[row]):
+    for idx, score in zip(all_indices[row], all_scores[row]):
         if idx < 0:
             continue
         pid = id_map.get(str(idx))
         if pid is not None:
             run[turn_key][pid] = float(score)
 
-# Compute metrics with ir_measures
 measures = [nDCG @ 3, nDCG @ k, RR @ k]
 results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
+
+# ================= TIMING: PER-CONVERSATION SWEEP =================
+def timed_sweep():
+    """One full pass: per conversation, time q0 (single) + follow-ups (one batch).
+
+    Returns the summed first-turn and follow-up latency over all conversations.
+    """
+    first_total_ms, followup_total_ms = 0.0, 0.0
+    for q0_row, fu_rows in zip(first_rows, followup_rows_per_conv):
+        t0 = time.perf_counter()
+        index.search(query_matrix[q0_row:q0_row + 1], k)
+        first_total_ms += (time.perf_counter() - t0) * 1000
+        if fu_rows:
+            t0 = time.perf_counter()
+            index.search(query_matrix[fu_rows], k)
+            followup_total_ms += (time.perf_counter() - t0) * 1000
+    return first_total_ms, followup_total_ms
+
+
+def latency_stats(times_ms):
+    if not times_ms:
+        return float("nan"), float("nan"), float("nan")
+    return min(times_ms), float(np.median(times_ms)), float(np.mean(times_ms))
+
+
+print(f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed "
+      f"per-conversation sweeps...")
+for _ in range(BATCH_WARMUP_RUNS):
+    timed_sweep()
+
+first_times, followup_times = [], []
+for run_i in range(BATCH_TIMED_RUNS):
+    f_ms, u_ms = timed_sweep()
+    first_times.append(f_ms)
+    followup_times.append(u_ms)
+    f_pq = f_ms / first_n if first_n else float("nan")
+    u_pq = u_ms / followup_n if followup_n else float("nan")
+    print(f"  run {run_i + 1}: first-turn total={f_ms:7.2f} ms (per-query={f_pq:.3f}) | "
+          f"follow-up total={u_ms:7.2f} ms (per-query={u_pq:.3f})")
+
 # ================= RESULTS =================
+f_min, f_med, f_mean = latency_stats(first_times)
+u_min, u_med, u_mean = latency_stats(followup_times)
+
+
+def per_query_line(stats, n):
+    lo, md, mn = stats
+    if not n:
+        return "n/a"
+    return f"{lo / n:8.3f}  /  {md / n:8.3f}  /  {mn / n:8.3f}  ms"
+
+
 print("\n" + "=" * 70)
 print(f"BASELINE EVALUATION RESULTS ({index_type.upper()}, {model_name})")
 print("=" * 70)
-print(f"Turns evaluated: {N}")
+print(f"Turns evaluated: {N}  ({first_n} first-turn, {followup_n} follow-up, "
+      f"{len(conv_rows)} conversations)")
 print(f"NDCG@3:  {results[nDCG @ 3]:.4f}")
 print(f"NDCG@10: {results[nDCG @ k]:.4f}")
 print(f"MRR@10:  {results[RR @ k]:.4f}")
 print()
-print(f"Batch latency  (min / median / mean over {BATCH_TIMED_RUNS} runs):")
-print(f"  total:     {batch_ms_min:8.2f}  /  {batch_ms_median:8.2f}  /  "
-      f"{batch_ms_mean:8.2f}  ms")
-print(f"  per query: {batch_ms_min / N:8.3f}  /  {batch_ms_median / N:8.3f}  /  "
-      f"{batch_ms_mean / N:8.3f}  ms")
+print(f"Latency, summed over conversations (min / median / mean over "
+      f"{BATCH_TIMED_RUNS} sweeps):")
+print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
+print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
+print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
+print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
 print("=" * 70)
 
 # Paper Table 1 — TREC CAsT 2019 baselines (full collection)
