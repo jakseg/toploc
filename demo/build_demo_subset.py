@@ -166,42 +166,65 @@ def make_resolver(collection_texts):
 
 # ================= SUBSET SELECTION =================
 def select_subset(collection_texts, judged, resolve, parquet_files):
-    """Stream embeddings once; keep all judged passages + reservoir of distractors."""
-    must = {}            # canonical_id -> embedding
-    reservoir = []       # list of (canonical_id, embedding)
-    seen_distractors = 0
-    dim = None
+    """Two-pass selection that never materialises the full 38M embedding column.
 
-    for pf in parquet_files:
-        table = pq.read_table(pf)
-        ids = [str(x) for x in table.column("id").to_pylist()]
-        embs = table.column("embedding").to_pylist()
-        for emb_id, emb in zip(ids, embs):
-            canon = resolve(emb_id)
+    Pass 1 reads only the tiny ``id`` column of every file to locate which
+    (file, row) holds each judged passage and to reservoir-sample distractor
+    positions. Pass 2 reads the embedding column only for the files that contain
+    selected rows and ``take()``s just those rows — so we convert ~24k vectors
+    to Python instead of 38M, which is the part that used to take an hour.
+    """
+    # ---- Pass 1: locate rows by id only (cheap I/O, no embeddings) ----
+    must_pos = {}          # canonical_id -> (file_idx, local_row)  (judged)
+    reservoir = []         # list of (canonical_id, file_idx, local_row)  (distractors)
+    seen_distractors = 0
+
+    for fi, pf in enumerate(parquet_files):
+        ids = pq.read_table(pf, columns=["id"]).column("id").to_pylist()
+        for row, emb_id in enumerate(ids):
+            canon = resolve(str(emb_id))
             if canon is None:
                 continue
-            if dim is None:
-                dim = len(emb)
             if canon in judged:
-                if canon not in must:
-                    must[canon] = emb
+                if canon not in must_pos:
+                    must_pos[canon] = (fi, row)
             else:
-                # Reservoir sampling of distractors (size TARGET_N is enough).
                 seen_distractors += 1
                 if len(reservoir) < TARGET_N:
-                    reservoir.append((canon, emb))
+                    reservoir.append((canon, fi, row))
                 else:
                     j = random.randint(0, seen_distractors - 1)
                     if j < TARGET_N:
-                        reservoir[j] = (canon, emb)
-        print(f"  scanned {os.path.basename(pf)}: kept {len(must)} judged so far")
+                        reservoir[j] = (canon, fi, row)
+        print(f"  scanned ids {os.path.basename(pf)}: "
+              f"{len(must_pos)} judged located so far")
 
-    budget = max(0, TARGET_N - len(must))
+    budget = max(0, TARGET_N - len(must_pos))
     random.shuffle(reservoir)
     distractors = reservoir[:budget]
 
-    subset = list(must.items()) + distractors
-    print(f"Subset: {len(must)} judged + {len(distractors)} distractors "
+    # ---- Plan which rows to fetch from each file ----
+    wanted = defaultdict(list)   # file_idx -> list of (local_row, canonical_id)
+    for canon, (fi, row) in must_pos.items():
+        wanted[fi].append((row, canon))
+    for canon, fi, row in distractors:
+        wanted[fi].append((row, canon))
+
+    # ---- Pass 2: read embeddings only for the wanted rows ----
+    emb_by_id = {}
+    dim = None
+    for fi in sorted(wanted):
+        rows, canons = zip(*wanted[fi])
+        col = pq.read_table(parquet_files[fi], columns=["embedding"]).column("embedding")
+        taken = col.take(pa.array(rows)).to_pylist()
+        for canon, emb in zip(canons, taken):
+            emb_by_id[canon] = emb
+            if dim is None:
+                dim = len(emb)
+
+    subset = list(emb_by_id.items())
+    n_judged = len(must_pos)
+    print(f"Subset: {n_judged} judged + {len(subset) - n_judged} distractors "
           f"= {len(subset)} passages (dim={dim})")
     return subset, dim
 
