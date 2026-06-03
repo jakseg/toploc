@@ -65,6 +65,66 @@ Quick sanity check with a single query:
 python test_ivf_pipeline.py <model>
 ```
 
+## Interactive Demo (Streamlit)
+
+A small Streamlit app that runs conversational retrieval over a compact subset
+(all judged passages + distractors) so it fits on a laptop. Per query it shows
+the retrieved passages, the number of vectors actually compared (a
+scale-independent efficiency proxy), the speedup vs exact search, and — for
+known CAsT turns — live NDCG/MRR. Exact and IVF use plain FAISS; **TopLoc IVF
+calls the real `toploc_search` C++ kernel** (the same one used in the benchmark
+scripts), with a pure-Python fallback if the module is not compiled.
+
+### 1. Get the demo subset (`demo/data/`)
+
+The demo needs a self-contained `demo/data/` folder (passages, FAISS indices,
+query embeddings, topics, qrels, meta). It is a generated artifact and **not**
+committed (gitignored). Two ways to obtain it:
+
+**a) Download the prebuilt subset (recommended).** It is attached as an asset to
+the `demo-data` release:
+
+```bash
+cd demo
+gh release download demo-data -p demo_data.zip   # or download from the Releases page
+unzip demo_data.zip                               # creates demo/data/
+```
+
+**b) Rebuild it (where the full data lives).**
+
+```bash
+python demo/build_demo_subset.py
+```
+
+The full 38M collection is only needed for rebuilding; the demo itself runs
+entirely off `demo/data/`.
+
+### 2. Set up the demo environment and build the C++ kernel
+
+Running the real `toploc_search` kernel needs FAISS with C++ dev files, so the
+demo uses a conda environment (`environment.yml`). A system C++ compiler is
+required for the build (macOS: `xcode-select --install`; Linux: `build-essential`).
+
+```bash
+./build_demo.sh        # creates the 'toploc-demo' conda env and compiles toploc_search
+```
+
+This recreates the environment from `environment.yml` and builds
+`toploc_search.*.so` (platform-specific, gitignored — run once per machine).
+
+### 3. Run the app
+
+```bash
+conda activate toploc-demo
+streamlit run demo/demo_app.py
+```
+
+Pick a known CAsT turn from the sidebar (precomputed embedding + metrics) or type
+a free-text query, switch between **Exact / IVF / TopLoc IVF**, and tune
+`nprobe` and the number of cached centroids `h`. In a conversation the first turn
+seeds the TopLoc cache (standard IVF search); follow-up turns reuse it and scan
+far fewer vectors.
+
 ## Data Structure
 
 ```

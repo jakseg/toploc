@@ -10,6 +10,10 @@ __pycache__/
 *.mmap
 *.bin
 
+# C++ build artifacts (toploc_search compiled via CMake)
+build/
+*.so
+
 # Generated demo artifacts (rebuilt by demo/build_demo_subset.py)
 demo/data/
 

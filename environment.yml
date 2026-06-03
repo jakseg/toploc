@@ -1,0 +1,22 @@
+name: toploc-demo
+# Environment for the laptop demo: faiss with C++ dev files (headers + lib +
+# CMake config) so the real toploc_search.cpp kernel can be compiled, plus the
+# Streamlit demo runtime. Recreate with:  conda env create -f environment.yml
+channels:
+  - conda-forge
+dependencies:
+  # Needs a system C++ compiler for the build:
+  #   macOS  -> Xcode Command Line Tools  (xcode-select --install)
+  #   Linux  -> gcc/g++                    (e.g. apt install build-essential)
+  - python=3.12
+  - faiss-cpu
+  - pybind11
+  - cmake
+  - numpy
+  - pip
+  - pip:
+      - streamlit
+      - pyarrow
+      - ir_measures
+      # optional: only needed to type free-text queries (live query encoding)
+      # - sentence-transformers

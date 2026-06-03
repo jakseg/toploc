@@ -122,6 +122,25 @@ py::tuple toploc_ivf_search_cpp(
     return py::make_tuple(scores_out, indices_out);
 }
 
+// ── Pointer-based entry point ─────────────────────────────────────
+// Some FAISS Python builds (e.g. the conda-forge wheel used for the
+// laptop demo) hand the index over as a SWIG proxy that pybind11 cannot
+// auto-convert to faiss::IndexIVF*. In that case the caller passes the
+// raw C++ pointer instead (Python: int(index.this)) and we cast it here.
+// The actual algorithm (toploc_ivf_search_cpp) is unchanged.
+py::tuple toploc_ivf_search_ptr(
+    uintptr_t index_ptr,
+    py::array_t<float> q_emb,
+    py::array_t<int64_t> cached_ids,
+    int nprobe,
+    int k
+) {
+    return toploc_ivf_search_cpp(
+        reinterpret_cast<faiss::IndexIVF*>(index_ptr),
+        q_emb, cached_ids, nprobe, k
+    );
+}
+
 // ── Register the function so Python can import it ─────────────────
 // This is what lets you write:
 //   from toploc_search import toploc_ivf_search
@@ -137,5 +156,15 @@ PYBIND11_MODULE(toploc_search, m) {
         py::arg("nprobe"),
         py::arg("k"),
         "TopLoc IVF restricted search — C++ implementation"
+    );
+    m.def(
+        "toploc_ivf_search_ptr",  // pointer-based variant for SWIG-proxy callers
+        &toploc_ivf_search_ptr,
+        py::arg("index_ptr"),
+        py::arg("q_emb"),
+        py::arg("cached_ids"),
+        py::arg("nprobe"),
+        py::arg("k"),
+        "TopLoc IVF restricted search — index passed as raw pointer"
     );
 }

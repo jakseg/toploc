@@ -9,6 +9,7 @@ Run:  streamlit run demo_app.py
 """
 
 import os
+import sys
 import json
 
 import numpy as np
@@ -19,6 +20,19 @@ import streamlit as st
 DEMO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 K = 10
 
+# Real TopLoc kernel: the compiled C++ module (toploc_search.cpp) shared with
+# toploc_ivf.py. Built into the repo root. If it is not compiled in this env,
+# fall back to an equivalent pure-Python path so the demo still runs.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    import toploc_search as _toploc_search
+    _HAVE_CPP = hasattr(_toploc_search, "toploc_ivf_search_ptr")
+except Exception:
+    _toploc_search = None
+    _HAVE_CPP = False
+
 st.set_page_config(page_title="TopLoc Conversational Search", layout="wide")
 
 
@@ -27,6 +41,9 @@ st.set_page_config(page_title="TopLoc Conversational Search", layout="wide")
 def load_demo():
     meta = json.load(open(os.path.join(DEMO_DIR, "meta.json")))
     exact = faiss.read_index(os.path.join(DEMO_DIR, "exact_index.index"))
+    # IndexIVFFlat already is a faiss::IndexIVF; int(ivf.this) is the pointer the
+    # C++ kernel expects. (Do NOT wrap in extract_index_ivf on a temporary — the
+    # base index would be GC'd and leave a dangling pointer.)
     ivf = faiss.read_index(os.path.join(DEMO_DIR, "ivf_index.index"))
     try:
         ivf.make_direct_map()
@@ -94,15 +111,33 @@ def centroid_vectors(quantizer, idx):
 
 
 def search_toploc(ivf, q, k, nprobe, cached_centroids, sizes):
-    """Restrict the coarse step to the cached centroids C0, then scan nprobe of them."""
+    """Restrict the coarse step to the cached centroids C0, then scan nprobe of them.
+
+    The ranking comes from the real C++ kernel in toploc_search.cpp (the very
+    function toploc_ivf.py calls); without the compiled module we use an
+    equivalent pure-Python path. ``scanned`` is computed here for the efficiency
+    metric and mirrors exactly what the kernel scans (h coarse + selected lists).
+    """
     cvecs = centroid_vectors(ivf.quantizer, cached_centroids)
     coarse = (cvecs @ q[0])  # inner product (vectors are normalized)
     npr = min(nprobe, len(cached_centroids))
     top_local = np.argpartition(-coarse, npr - 1)[:npr]
     top_local = top_local[np.argsort(-coarse[top_local])]
     sel = cached_centroids[top_local].astype("int64").reshape(1, -1)
-    sel_coarse = coarse[top_local].astype("float32").reshape(1, -1)
     scanned = int(len(cached_centroids) + sizes[sel[0]].sum())  # h coarse + scanned lists
+
+    if _HAVE_CPP:
+        # Real C++ TopLoc search. Index handed over as raw pointer (int(ivf.this))
+        # because the conda faiss build hands Python a SWIG proxy.
+        scores, idx = _toploc_search.toploc_ivf_search_ptr(
+            int(ivf.this), q,
+            np.ascontiguousarray(cached_centroids, dtype="int64"),
+            int(nprobe), int(k))
+        return scores[0], idx[0], scanned
+
+    # Pure-Python fallback (identical algorithm).
+    sel_coarse = coarse[top_local].astype("float32").reshape(1, -1)
+    ivf.nprobe = npr  # search_preassigned asserts sel.shape == (n, ivf.nprobe)
     try:
         scores, idx = ivf.search_preassigned(q, k, sel, sel_coarse)
     except TypeError:
@@ -170,9 +205,14 @@ if query_vec is not None:
     is_first = len(st.session_state.history) == 0
     if method == "TopLoc IVF":
         if is_first or st.session_state.toploc_cache is None:
+            # First turn: a standard IVF search seeds the conversation cache
+            # (coarse over all centroids) — exactly like toploc_ivf.py turn 0.
             st.session_state.toploc_cache = build_toploc_cache(ivf, query_vec, h)
-        scores, idx, scanned = search_toploc(ivf, query_vec, K,
-                                             nprobe, st.session_state.toploc_cache, sizes)
+            scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
+        else:
+            # Follow-up turns: restricted search over the cached centroids (C++).
+            scores, idx, scanned = search_toploc(ivf, query_vec, K, nprobe,
+                                                 st.session_state.toploc_cache, sizes)
     elif method == "IVF":
         scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
     else:
