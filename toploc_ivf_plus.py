@@ -51,18 +51,14 @@ cache_dir = CACHE_DIRS[model_name]
 
 # TopLoc-IVF+ hyperparameters (paper Section 3)
 H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))  # h ∈ {512,1024,4096,8192}
-NP = int(os.environ.get("NP", 8))  # nprobe
+NP = int(
+    os.environ.get("NP", 8)
+)  # nprobe — see note below; q0 full search uses this too
 ALPHA = float(os.environ.get("ALPHA", 0.1))  # α ∈ {0.0,0.05,0.1,0.2}
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 
 # faiss.omp_set_num_threads(1)  # uncomment for single-threaded reproducible timing
-
-
-# ================= REMOVED =================
-# dcg()  — deleted, ir_measures handles this
-# ndcg() — deleted, ir_measures handles this
-# mrr()  — deleted, ir_measures handles this
 
 
 # ================= QUERY ENCODER =================
@@ -149,20 +145,6 @@ def rank_within_cache(centroid_vecs, q_emb, nprobe, use_ip):
 # It handles centroid fetching + scoring + search_preassigned internally.
 
 
-# ================= FLEXIBLE PARSERS =================
-def split_flexible(line, expected):
-    for sep in ("\t", ","):
-        parts = [p.strip() for p in line.split(sep)]
-        if len(parts) == expected:
-            return parts
-    parts = line.split()
-    if len(parts) == expected:
-        return parts
-    if expected == 4 and len(parts) > 4:
-        return [parts[0], parts[1], " ".join(parts[2:-1]), parts[-1]]
-    return None
-
-
 # ================= LOAD INDEX =================
 print(f"Evaluating TopLoc-IVF+ for: {model_name} ({index_type})")
 index_path = os.path.join(cache_dir, f"{index_type}_index.index")
@@ -198,30 +180,31 @@ id_map = {str(i): str(pid) for i, pid in enumerate(id_array)}
 indexed_pids = set(id_map.values())
 
 # ================= LOAD TOPICS =================
+# Match baseline: split on first comma only, preserving commas in query text
 topics = {}
 with open(os.path.join(DATASET_DIR, "topics.tsv"), "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = split_flexible(line, 2)
-        if parts:
-            topics[parts[0]] = parts[1]
+        parts = line.split(",", 1)
+        if len(parts) == 2:
+            topics[parts[0].strip()] = parts[1].strip()
 
 if not topics:
     raise RuntimeError("Parsed 0 topics. Check the delimiter/format of topics.tsv.")
 
 # ================= LOAD QRELS =================
+# Match baseline: qrels are comma-separated
 qrels = defaultdict(dict)
 with open(os.path.join(DATASET_DIR, "qrels.qrel"), "r", encoding="utf-8") as f:
     for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        parts = split_flexible(line, 4)
-        if not parts:
+        parts = line.strip().split(",")
+        if len(parts) != 4:
             continue
         qid, _, pid, score = parts
+        qid = qid.strip()
+        pid = pid.strip()
         try:
             score = int(score)
         except ValueError:
@@ -262,10 +245,11 @@ run = defaultdict(dict)
 
 for conv_id, turns in conversations.items():
     q0_key = turns[0]
-    if q0_key not in filtered_qrels:
-        continue
 
-    # ---- TURN 0: full search + build initial cache ----
+    # ---- TURN 0: full search + build initial cache (ALWAYS RUN) ----
+    # The cache (c0_vecs / top_0_local) must be built even when q0 is unjudged,
+    # because the follow-up turns of this conversation depend on it. Only the
+    # timing + run recording below are gated on q0 being judged.
     q0_emb = encode_query(topics[q0_key])
     start = time.perf_counter()
     _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
@@ -284,18 +268,18 @@ for conv_id, turns in conversations.items():
     scores, indices = base_index.search(q0_emb, k)
     end = time.perf_counter()
 
-    if evaluated_turns >= warmup:
-        times.append((end - start) * 1000)
+    if q0_key in filtered_qrels:
+        if evaluated_turns >= warmup:
+            times.append((end - start) * 1000)
 
-    # build run dict for ir_measures
-    for idx, score in zip(indices[0], scores[0]):
-        if idx < 0:
-            continue
-        pid = id_map.get(str(idx))
-        if pid is not None:
-            run[q0_key][pid] = float(score)
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < 0:
+                continue
+            pid = id_map.get(str(idx))
+            if pid is not None:
+                run[q0_key][pid] = float(score)
 
-    evaluated_turns += 1
+        evaluated_turns += 1
 
     # ---- TURNS 1+: I0 proxy -> conditional refresh -> C++ restricted search ----
     for turn_key in turns[1:]:
@@ -355,6 +339,9 @@ for conv_id, turns in conversations.items():
         evaluated_turns += 1
 
 # ================= COMPUTE METRICS WITH ir_measures =================
+# Sanity check to compare with the baseline run dict
+print(f"\nDEBUG: I have {len(run)} turns in my run dict.")
+
 measures = [nDCG @ 3, nDCG @ k, RR @ k]
 results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
