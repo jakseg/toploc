@@ -32,7 +32,7 @@ import faiss
 from collections import defaultdict
 import ir_measures
 from ir_measures import nDCG, RR
-from toploc_search import toploc_ivf_search  # ← C++ version
+from toploc_search import toploc_ivf_search, toploc_ivf_search_ptr  # ← C++ version
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
@@ -317,7 +317,7 @@ for conv_id, turns in conversations.items():
 
         # C++ does centroid fetch + scoring + search_preassigned in one shot
         scores, indices = toploc_ivf_search(
-            ivf_index,
+            int(ivf_index.this),
             qj_emb,
             cache["c0"],
             NP,

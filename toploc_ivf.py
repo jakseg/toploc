@@ -7,7 +7,7 @@ import faiss
 from collections import defaultdict
 import ir_measures
 from ir_measures import nDCG, RR
-from toploc_search import toploc_ivf_search  # C++ version
+from toploc_search import toploc_ivf_search, toploc_ivf_search_ptr  # C++ version
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
@@ -206,8 +206,11 @@ for conv_id, turns in conversations.items():
     fu_embs = encode_batch(fu_texts)
 
     start_fu = time.perf_counter()
-    scores_fu, indices_fu = toploc_ivf_search(
-        ivf_index, fu_embs, conv_cache[conv_id], NP, k
+    # scores_fu, indices_fu = toploc_ivf_search(
+    #     ivf_index, fu_embs, conv_cache[conv_id], NP, k
+    # )
+    scores_fu, indices_fu = toploc_ivf_search_ptr(
+        int(ivf_index.this), fu_embs, conv_cache[conv_id], NP, k
     )
     followup_times.append((time.perf_counter() - start_fu) * 1000)
     followup_n += len(followup_keys)
