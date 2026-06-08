@@ -285,6 +285,12 @@ for run_i in range(BATCH_TIMED_RUNS):
 f_min, f_med, f_mean = latency_stats(first_times)
 u_min, u_med, u_mean = latency_stats(followup_times)
 
+# Overall = first-turn + follow-up combined, per sweep. This collapses the
+# single/batch split back into one average query latency over all N turns,
+# which is what the paper's "Time" column reports (mean ms per query).
+overall_times = [f + u for f, u in zip(first_times, followup_times)]
+o_min, o_med, o_mean = latency_stats(overall_times)
+
 
 def per_query_line(stats, n):
     lo, md, mn = stats
@@ -308,6 +314,9 @@ print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f} 
 print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
 print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
 print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
+print(f"  overall    total:     {o_min:8.2f}  /  {o_med:8.2f}  /  {o_mean:8.2f}  ms")
+print(f"  overall    per query: {per_query_line((o_min, o_med, o_mean), N)}"
+      f"   <- compare to paper Time")
 print("=" * 70)
 
 # Paper Table 1 — TREC CAsT 2019 baselines (full collection)
