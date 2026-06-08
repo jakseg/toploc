@@ -170,24 +170,32 @@ def toploc_ivf_search(ivf_index, q_emb, cached_ids, cached_vecs, nprobe, k):
     # This is the same FAISS function the C++ version called.
     # It scans only the posting lists we selected — not the full index.
     # FAISS handles threading, SIMD, everything.
-    D = np.empty((nq, k), dtype="float32")
-    I = np.empty((nq, k), dtype="int64")
-    D.fill(-1e38)
-    I.fill(-1)
+    # D = np.empty((nq, k), dtype="float32")
+    # I = np.empty((nq, k), dtype="int64")
+    # D.fill(-1e38)
+    # I.fill(-1)
 
+    # old_nprobe = ivf_index.nprobe
+    # ivf_index.nprobe = actual_nprobe
+
+    # ivf_index.search_preassigned(
+    #     nq,
+    #     faiss.swig_ptr(q_c),
+    #     k,
+    #     faiss.swig_ptr(sel_ids_c),
+    #     faiss.swig_ptr(sel_scores_c),
+    #     faiss.swig_ptr(D),
+    #     faiss.swig_ptr(I),
+    #     False,  # store_pairs
+    # )
+
+    # ivf_index.nprobe = old_nprobe
+    # return D, I
+    # FIXING OLD API CALL
     old_nprobe = ivf_index.nprobe
     ivf_index.nprobe = actual_nprobe
 
-    ivf_index.search_preassigned(
-        nq,
-        faiss.swig_ptr(q_c),
-        k,
-        faiss.swig_ptr(sel_ids_c),
-        faiss.swig_ptr(sel_scores_c),
-        faiss.swig_ptr(D),
-        faiss.swig_ptr(I),
-        False,  # store_pairs
-    )
+    D, I = ivf_index.search_preassigned(q_c, k, sel_ids_c, sel_scores_c)
 
     ivf_index.nprobe = old_nprobe
     return D, I
