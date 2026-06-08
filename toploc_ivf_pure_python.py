@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+"""
+TopLoc-IVF evaluation — PURE PYTHON, no C++ module needed.
+
+The restricted search uses:
+  1. numpy matrix multiply for centroid scoring (BLAS-backed, all cores)
+  2. numpy argpartition for top-nprobe selection
+  3. FAISS search_preassigned for list scanning (FAISS internals, all cores)
+
+All heavy work goes through optimized libraries — no hand-written loops.
+
+Run:
+    python3 toploc_ivf.py snowflake ivf
+    NP=8  python3 toploc_ivf.py snowflake ivf
+    NP=32 python3 toploc_ivf.py snowflake ivf
+"""
+
 import os
 import sys
 import time
@@ -7,7 +23,6 @@ import faiss
 from collections import defaultdict
 import ir_measures
 from ir_measures import nDCG, RR
-from toploc_search import toploc_ivf_search, toploc_ivf_search_ptr  # C++ version
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
@@ -25,7 +40,7 @@ index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 cache_dir = CACHE_DIRS[model_name]
 
 H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))
-NP = int(os.environ.get("NP", 128))  # match baseline nprobe default
+NP = int(os.environ.get("NP", 128))
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 
 # Latency benchmarking config — mirror the baseline
@@ -84,6 +99,98 @@ def load_query_encoder(model_name):
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
+
+
+# ================= HELPERS =================
+def get_centroid_vectors(quantizer, centroid_indices):
+    """Reconstruct centroid vectors from the IVF quantizer."""
+    idx = np.asarray(centroid_indices, dtype="int64")
+    try:
+        return quantizer.reconstruct_batch(idx).astype("float32")
+    except (AttributeError, RuntimeError):
+        d = quantizer.d
+        vecs = np.empty((len(idx), d), dtype="float32")
+        for local_i, global_i in enumerate(idx):
+            vecs[local_i] = quantizer.reconstruct(int(global_i))
+        return vecs
+
+
+def toploc_ivf_search(ivf_index, q_emb, cached_ids, cached_vecs, nprobe, k):
+    """
+    Pure Python TopLoc IVF restricted search.
+
+    Instead of searching all centroids (like the baseline does),
+    we only score and search within the cached centroid set.
+
+    Three steps, all using optimized libraries:
+      1. numpy BLAS matrix multiply  → score cached centroids (all cores)
+      2. numpy argpartition          → pick top nprobe
+      3. FAISS search_preassigned    → scan only those posting lists (all cores)
+    """
+    nq = q_emb.shape[0]
+    H = len(cached_ids)
+    actual_nprobe = min(nprobe, H)
+    use_ip = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
+
+    # ── Step 1: Score all cached centroids against all queries ────
+    # This is a matrix multiply. numpy calls BLAS under the hood,
+    # which uses all CPU cores and SIMD — same as what FAISS does
+    # internally for the coarse step in a normal search.
+    if use_ip:
+        # Inner product: (nq, d) @ (H, d).T → (nq, H), higher = closer
+        all_scores = q_emb @ cached_vecs.T
+    else:
+        # L2 squared distance: ||q - c||^2 = ||q||^2 + ||c||^2 - 2*q·c
+        q_sq = np.sum(q_emb**2, axis=1, keepdims=True)  # (nq, 1)
+        c_sq = np.sum(cached_vecs**2, axis=1).reshape(1, -1)  # (1, H)
+        all_scores = q_sq + c_sq - 2.0 * (q_emb @ cached_vecs.T)  # (nq, H)
+
+    # ── Step 2: Pick top nprobe centroids per query ───────────────
+    if use_ip:
+        # Want largest — negate for argpartition (finds smallest)
+        top_local = np.argpartition(-all_scores, actual_nprobe, axis=1)[
+            :, :actual_nprobe
+        ]
+    else:
+        # Want smallest distances
+        top_local = np.argpartition(all_scores, actual_nprobe, axis=1)[
+            :, :actual_nprobe
+        ]
+
+    # Gather scores for selected centroids and map to global IDs
+    sel_scores = np.take_along_axis(all_scores, top_local, axis=1).astype("float32")
+    sel_ids = cached_ids[top_local].astype("int64")
+
+    # Ensure contiguous arrays (FAISS requires this)
+    q_c = np.ascontiguousarray(q_emb, dtype="float32")
+    sel_ids_c = np.ascontiguousarray(sel_ids, dtype="int64")
+    sel_scores_c = np.ascontiguousarray(sel_scores, dtype="float32")
+
+    # ── Step 3: Restricted search via FAISS search_preassigned ────
+    # This is the same FAISS function the C++ version called.
+    # It scans only the posting lists we selected — not the full index.
+    # FAISS handles threading, SIMD, everything.
+    D = np.empty((nq, k), dtype="float32")
+    I = np.empty((nq, k), dtype="int64")
+    D.fill(-1e38)
+    I.fill(-1)
+
+    old_nprobe = ivf_index.nprobe
+    ivf_index.nprobe = actual_nprobe
+
+    ivf_index.search_preassigned(
+        nq,
+        faiss.swig_ptr(q_c),
+        k,
+        faiss.swig_ptr(sel_ids_c),
+        faiss.swig_ptr(sel_scores_c),
+        faiss.swig_ptr(D),
+        faiss.swig_ptr(I),
+        False,  # store_pairs
+    )
+
+    ivf_index.nprobe = old_nprobe
+    return D, I
 
 
 # ================= LOAD INDEX =================
@@ -171,17 +278,15 @@ for turn_key in topics:
 print(f"Grouped {len(topics)} turns into {len(conversations)} conversations")
 
 # ================= ENCODE ONCE + BUILD RUN (untimed) =================
-# Retrieval results are independent of timing, so we run everything once
-# (untimed) to build the run dict and populate the per-conversation cache.
-# Latency is measured separately below, mirroring the baseline.
 print(f"\nLoading {model_name} query encoder...")
 encode_batch = load_query_encoder(model_name)
 print("Encoding queries and building run dict (untimed)...")
 
-conv_cache = {}  # conv_id -> cached centroid ids (int64)
-conv_q0_emb = {}  # conv_id -> q0 embedding (1, d)   [only if q0 judged]
-conv_fu_embs = {}  # conv_id -> follow-up embeddings (nq, d)
-conv_fu_keys = {}  # conv_id -> list of follow-up turn keys
+conv_cache = {}  # conv_id -> cached centroid IDs (int64)
+conv_cvecs = {}  # conv_id -> pre-reconstructed centroid vectors (float32)
+conv_q0_emb = {}  # conv_id -> q0 embedding (only if q0 judged)
+conv_fu_embs = {}  # conv_id -> follow-up embeddings
+conv_fu_keys = {}  # conv_id -> follow-up turn keys
 k = 10
 run = defaultdict(dict)
 
@@ -192,7 +297,13 @@ for conv_id, turns in conversations.items():
     # ---- TURN 0: build cache (ALWAYS) + full search ----
     q0_emb = encode_batch([topics[q0_key]])
     _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
-    conv_cache[conv_id] = c0_indices[0].astype("int64")
+
+    c0_ids = c0_indices[0].astype("int64")
+    c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_ids)
+
+    conv_cache[conv_id] = c0_ids
+    conv_cvecs[conv_id] = c0_vecs
+
     scores_0, indices_0 = base_index.search(q0_emb, k)
 
     if q0_key in filtered_qrels:
@@ -209,8 +320,8 @@ for conv_id, turns in conversations.items():
     conv_fu_embs[conv_id] = fu_embs
     conv_fu_keys[conv_id] = followup_keys
 
-    scores_fu, indices_fu = toploc_ivf_search_ptr(
-        int(ivf_index.this), fu_embs, conv_cache[conv_id], NP, k
+    scores_fu, indices_fu = toploc_ivf_search(
+        ivf_index, fu_embs, c0_ids, c0_vecs, NP, k
     )
     for row_idx, turn_key in enumerate(followup_keys):
         for idx, score in zip(indices_fu[row_idx], scores_fu[row_idx]):
@@ -228,15 +339,10 @@ results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
 
 # ================= TIMING: PER-CONVERSATION SWEEP =================
-# One full pass: per conversation, time q0 (full search + cache build) and the
-# follow-up batch (cached search) separately. The cache is already built above,
-# so follow-up timing reuses it — exactly how it would work at serving time.
 def timed_sweep():
     first_total_ms, followup_total_ms = 0.0, 0.0
     for conv_id, turns in conversations.items():
-        q0_key = turns[0]
-
-        # Time q0 only if judged (mirror run-dict membership)
+        # Time q0 only if judged
         if conv_id in conv_q0_emb:
             q0_emb = conv_q0_emb[conv_id]
             t0 = time.perf_counter()
@@ -244,12 +350,13 @@ def timed_sweep():
             base_index.search(q0_emb, k)  # full search
             first_total_ms += (time.perf_counter() - t0) * 1000
 
-        # Time the follow-up batch using the prebuilt cache
+        # Time follow-up batch using prebuilt cache
         if conv_id in conv_fu_keys:
             fu_embs = conv_fu_embs[conv_id]
-            cache = conv_cache[conv_id]
+            c_ids = conv_cache[conv_id]
+            c_vecs = conv_cvecs[conv_id]
             t0 = time.perf_counter()
-            toploc_ivf_search_ptr(int(ivf_index.this), fu_embs, cache, NP, k)
+            toploc_ivf_search(ivf_index, fu_embs, c_ids, c_vecs, NP, k)
             followup_total_ms += (time.perf_counter() - t0) * 1000
 
     return first_total_ms, followup_total_ms
