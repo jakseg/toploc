@@ -1,36 +1,43 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/impl/FaissException.h>
 #include <vector>
 #include <algorithm>
-#include <numeric>
+#include <memory>
 #include <stdexcept>
 
 namespace py = pybind11;
 
 /*
- * Batched TopLoc IVF restricted search.
+ * Fast batched TopLoc IVF restricted search.
  *
- * Difference from the single-query version: q_emb may now be (nq, d).
- * The H cached centroids are reconstructed ONCE and reused across all nq
- * queries; each query independently picks its own top-nprobe subset, and a
- * single search_preassigned call covers the whole batch.
+ * The previous version scored the H cached centroids with a hand-written
+ * single-threaded loop -- that was the bottleneck that made TopLoc slower
+ * than the baseline. Here that loop is replaced by a temporary FAISS
+ * IndexFlat: FAISS scores the centroids with BLAS, all CPU cores, and SIMD,
+ * exactly the optimized path the baseline's own coarse step uses.
  *
- * Inputs are forced to C-contiguous float32 / int64 by the binding signature,
- * so the raw pointer arithmetic below is always valid.
+ * Optionally accepts pre-reconstructed centroid vectors (cached_vecs) so the
+ * reconstruct step is done ONCE per conversation in Python rather than on
+ * every call.
+ *
+ * Pipeline: score cached centroids (FAISS flat) -> pick top-nprobe per query
+ *           -> search_preassigned over the whole batch (FAISS). No hand loops.
  */
 py::tuple toploc_ivf_search_cpp(
-    faiss::IndexIVF* index,                                   // your ivf_index
+    faiss::IndexIVF* index,
     py::array_t<float,   py::array::c_style | py::array::forcecast> q_emb,       // (nq, d) or (d,)
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> cached_ids,  // (H,)
-    int nprobe,                                               // your NP
-    int k                                                     // your k (=10)
+    int nprobe,
+    int k,
+    py::object cached_vecs_obj = py::none()   // optional (H, d) float32
 ) {
     auto q_buf     = q_emb.request();
     auto cache_buf = cached_ids.request();
 
-    // ── Accept (nq, d) batch or (d,) single query ────────────────
+    // -- Accept (nq, d) batch or (d,) single query --
     int nq, d;
     if (q_buf.ndim == 2) {
         nq = static_cast<int>(q_buf.shape[0]);
@@ -47,66 +54,51 @@ py::tuple toploc_ivf_search_cpp(
 
     float*   q_ptr   = static_cast<float*>(q_buf.ptr);
     int64_t* ids_ptr = static_cast<int64_t*>(cache_buf.ptr);
-    int      H       = static_cast<int>(cache_buf.shape[0]);   // # cached centroids
-
+    int      H       = static_cast<int>(cache_buf.shape[0]);
     int actual_nprobe = std::min(nprobe, H);
 
-    // ── Step 1: Reconstruct the H cached centroid vectors ONCE ────
-    // Shared across every query in the batch — this is the work we save
-    // relative to scoring the full centroid set per query.
-    std::vector<float> centroid_vecs(static_cast<size_t>(H) * d);
-    for (int i = 0; i < H; i++) {
-        index->quantizer->reconstruct(
-            ids_ptr[i], centroid_vecs.data() + static_cast<size_t>(i) * d);
-    }
-
-    bool use_ip = (index->metric_type == faiss::METRIC_INNER_PRODUCT);
-
-    // ── Per-query preassigned data, laid out row-major (nq, actual_nprobe) ─
-    std::vector<int64_t> sel_centroids(static_cast<size_t>(nq) * actual_nprobe);
-    std::vector<float>   sel_coarse(static_cast<size_t>(nq) * actual_nprobe);
-
-    // Scratch reused across queries to avoid per-query allocation.
-    std::vector<float> coarse_scores(H);
-    std::vector<int>   order(H);
-
-    // ── Step 2+3: For each query, score cached centroids and pick top-nprobe ─
-    for (int qi = 0; qi < nq; qi++) {
-        const float* q = q_ptr + static_cast<size_t>(qi) * d;
-
+    // -- Get centroid vectors (reuse if Python passed them) --
+    float* cvecs_ptr = nullptr;
+    std::vector<float> cvecs_storage;
+    if (!cached_vecs_obj.is_none()) {
+        auto cv = py::cast<py::array_t<float, py::array::c_style | py::array::forcecast>>(cached_vecs_obj);
+        auto cv_buf = cv.request();
+        if (cv_buf.shape[0] != H || cv_buf.shape[1] != d) {
+            throw std::runtime_error("cached_vecs shape must be (H, d)");
+        }
+        cvecs_ptr = static_cast<float*>(cv_buf.ptr);
+    } else {
+        cvecs_storage.resize(static_cast<size_t>(H) * d);
         for (int i = 0; i < H; i++) {
-            const float* cv = centroid_vecs.data() + static_cast<size_t>(i) * d;
-            float s = 0.0f;
-            if (use_ip) {
-                // inner product: higher = closer
-                for (int j = 0; j < d; j++) s += cv[j] * q[j];
-            } else {
-                // L2: store negative squared distance so larger = closer
-                for (int j = 0; j < d; j++) {
-                    float diff = cv[j] - q[j];
-                    s -= diff * diff;
-                }
-            }
-            coarse_scores[i] = s;
+            index->quantizer->reconstruct(
+                ids_ptr[i], cvecs_storage.data() + static_cast<size_t>(i) * d);
         }
+        cvecs_ptr = cvecs_storage.data();
+    }
 
-        std::iota(order.begin(), order.end(), 0);
-        std::partial_sort(
-            order.begin(),
-            order.begin() + actual_nprobe,
-            order.end(),
-            [&](int a, int b) { return coarse_scores[a] > coarse_scores[b]; }
-        );
+    // -- Score cached centroids with FAISS (BLAS, all cores) --
+    // This replaces the old single-threaded scoring loop.
+    std::unique_ptr<faiss::IndexFlat> temp_index;
+    if (index->metric_type == faiss::METRIC_INNER_PRODUCT) {
+        temp_index = std::make_unique<faiss::IndexFlatIP>(d);
+    } else {
+        temp_index = std::make_unique<faiss::IndexFlatL2>(d);
+    }
+    temp_index->add(H, cvecs_ptr);
 
-        int64_t* sc_row = sel_centroids.data() + static_cast<size_t>(qi) * actual_nprobe;
-        float*   co_row = sel_coarse.data()    + static_cast<size_t>(qi) * actual_nprobe;
-        for (int i = 0; i < actual_nprobe; i++) {
-            sc_row[i] = ids_ptr[order[i]];
-            co_row[i] = coarse_scores[order[i]];
+    std::vector<float>   coarse_dists(static_cast<size_t>(nq) * actual_nprobe);
+    std::vector<int64_t> coarse_labels(static_cast<size_t>(nq) * actual_nprobe);
+    temp_index->search(nq, q_ptr, actual_nprobe,
+                       coarse_dists.data(), coarse_labels.data());
+
+    // Map local labels (0..H-1) -> global centroid IDs
+    for (size_t i = 0; i < static_cast<size_t>(nq) * actual_nprobe; i++) {
+        if (coarse_labels[i] >= 0) {
+            coarse_labels[i] = ids_ptr[coarse_labels[i]];
         }
     }
 
-    // ── Step 4: Allocate (nq, k) outputs ─────────────────────────
+    // -- Allocate (nq, k) outputs --
     auto scores_out  = py::array_t<float>  ({nq, k});
     auto indices_out = py::array_t<int64_t>({nq, k});
     float*   out_scores  = static_cast<float*>(scores_out.request().ptr);
@@ -116,47 +108,40 @@ py::tuple toploc_ivf_search_cpp(
     std::fill(out_indices, out_indices + static_cast<size_t>(nq) * k,
               static_cast<int64_t>(-1));
 
-    // ── Step 5: One restricted search over the whole batch ───────
-    // Pin the probe count explicitly so FAISS reads sel_centroids / sel_coarse
-    // as exactly actual_nprobe columns per query, independent of index->nprobe.
+    // -- One restricted search over the whole batch --
     faiss::IVFSearchParameters params;
     params.nprobe    = actual_nprobe;
     params.max_codes = 0;
 
     index->search_preassigned(
-        nq,                   // batch size
-        q_ptr,                // queries (nq, d)
-        k,                    // top-k
-        sel_centroids.data(), // (nq, actual_nprobe) selected lists
-        sel_coarse.data(),    // (nq, actual_nprobe) coarse distances
-        out_scores,           // (nq, k) output scores
-        out_indices,          // (nq, k) output ids
-        false,                // store_pairs
+        nq, q_ptr, k,
+        coarse_labels.data(), coarse_dists.data(),
+        out_scores, out_indices,
+        false,    // store_pairs
         &params
     );
 
     return py::make_tuple(scores_out, indices_out);
 }
 
-// ── Pointer-based entry point (SWIG-proxy callers) ────────────────
-// If pybind11 cannot auto-convert the FAISS index handed over from Python,
-// pass the raw C++ pointer instead (Python: int(index.this)) and cast here.
+// -- Pointer-based entry point (SWIG-proxy callers) --
 py::tuple toploc_ivf_search_ptr(
     uintptr_t index_ptr,
     py::array_t<float,   py::array::c_style | py::array::forcecast> q_emb,
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> cached_ids,
     int nprobe,
-    int k
+    int k,
+    py::object cached_vecs_obj = py::none()
 ) {
     return toploc_ivf_search_cpp(
         reinterpret_cast<faiss::IndexIVF*>(index_ptr),
-        q_emb, cached_ids, nprobe, k
+        q_emb, cached_ids, nprobe, k, cached_vecs_obj
     );
 }
 
-// ── Module registration ───────────────────────────────────────────
+// -- Module registration --
 PYBIND11_MODULE(toploc_search, m) {
-    m.doc() = "Fast batched TopLoc IVF search implemented in C++";
+    m.doc() = "Fast batched TopLoc IVF search -- FAISS-backed scoring";
     m.def(
         "toploc_ivf_search",
         &toploc_ivf_search_cpp,
@@ -165,6 +150,7 @@ PYBIND11_MODULE(toploc_search, m) {
         py::arg("cached_ids"),
         py::arg("nprobe"),
         py::arg("k"),
+        py::arg("cached_vecs") = py::none(),
         "Batched TopLoc IVF restricted search (q_emb: (nq, d) or (d,))"
     );
     m.def(
@@ -175,6 +161,7 @@ PYBIND11_MODULE(toploc_search, m) {
         py::arg("cached_ids"),
         py::arg("nprobe"),
         py::arg("k"),
-        "Batched TopLoc IVF restricted search — index passed as raw pointer"
+        py::arg("cached_vecs") = py::none(),
+        "Batched TopLoc IVF restricted search -- index passed as raw pointer"
     );
 }
