@@ -27,6 +27,8 @@ model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 cache_dir = CACHE_DIRS[model_name]
 
+USE_MMAP = os.environ.get("MMAP", "0") == "1"
+
 # Use all available cores for FAISS
 faiss.omp_set_num_threads(os.cpu_count() or 1)
 
@@ -125,8 +127,12 @@ if not os.path.exists(index_path):
     print("Run create_index.py first to build it.")
     sys.exit(1)
 
-index = faiss.read_index(index_path)
-print(f"{index_type.upper()} index loaded: {index.ntotal} vectors, trained={index.is_trained}")
+if USE_MMAP:
+    index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
+else:
+    index = faiss.read_index(index_path)
+print(f"{index_type.upper()} index loaded: {index.ntotal} vectors, "
+      f"trained={index.is_trained}, mmap={USE_MMAP}")
 
 if index_type == "ivf":
     index.nprobe = 128
