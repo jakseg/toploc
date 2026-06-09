@@ -138,7 +138,7 @@ if index_type == "ivf":
     index.nprobe = 128
     print(f"Set nprobe={index.nprobe}")
 elif index_type == "hnsw":
-    index.hnsw.efSearch = 64
+    index.hnsw.efSearch = int(os.environ.get("EF_SEARCH", 64))
     print(f"Set efSearch={index.hnsw.efSearch}")
 
 # 2. ID Mapping (built inline with the index by create_index.py)
