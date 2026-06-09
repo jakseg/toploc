@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-TopLoc-IVF evaluation — PURE PYTHON, no C++ module needed.
+TopLoc-IVF evaluation — MEGA-BATCHED pure Python.
 
-The restricted search uses:
-  1. numpy matrix multiply for centroid scoring (BLAS-backed, all cores)
-  2. numpy argpartition for top-nprobe selection
-  3. FAISS search_preassigned for list scanning (FAISS internals, all cores)
-
-All heavy work goes through optimized libraries — no hand-written loops.
+Key optimization over previous version:
+  - ALL follow-ups across ALL conversations are collected and issued as
+    ONE search_preassigned call, maximizing FAISS batch parallelism.
+  - ALL first turns are also batched into one quantizer.search + one
+    search_preassigned call.
+  - All centroids reconstructed ONCE at startup.
 
 Run:
-    python3 toploc_ivf.py snowflake ivf
-    NP=8  python3 toploc_ivf.py snowflake ivf
-    NP=32 python3 toploc_ivf.py snowflake ivf
+    python3 toploc_ivf_megabatch.py snowflake ivf
+    NP=8   python3 toploc_ivf_megabatch.py snowflake ivf
+    NP=32  python3 toploc_ivf_megabatch.py snowflake ivf
 """
 
 import os
@@ -43,15 +43,13 @@ H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))
 NP = int(os.environ.get("NP", 128))
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 
-# Latency benchmarking config — mirror the baseline
 BATCH_WARMUP_RUNS = 2
 BATCH_TIMED_RUNS = 5
 
-# Use all available cores for FAISS — match the baseline
 faiss.omp_set_num_threads(os.cpu_count() or 1)
 
 
-# ================= QUERY ENCODER (Batched) =================
+# ================= QUERY ENCODER =================
 def load_query_encoder(model_name):
     if model_name == "snowflake":
         from sentence_transformers import SentenceTransformer
@@ -67,14 +65,13 @@ def load_query_encoder(model_name):
             ).astype("float32")
 
         return encode_batch
-
     elif model_name == "dragon":
         import torch
         from transformers import AutoTokenizer, AutoModel
 
         tokenizer = AutoTokenizer.from_pretrained("facebook/dragon-plus-query-encoder")
-        model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
-        model.eval()
+        enc_model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
+        enc_model.eval()
 
         def encode_batch(queries, chunk=32):
             outs = []
@@ -88,98 +85,19 @@ def load_query_encoder(model_name):
                     return_tensors="pt",
                 )
                 with torch.no_grad():
-                    outputs = model(**tokens)
                     emb = torch.nn.functional.normalize(
-                        outputs.last_hidden_state[:, 0, :], p=2, dim=1
+                        enc_model(**tokens).last_hidden_state[:, 0, :], p=2, dim=1
                     )
                 outs.append(emb.cpu().numpy())
             return np.vstack(outs).astype("float32")
 
         return encode_batch
-
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
 
-# ================= HELPERS =================
-def get_centroid_vectors(quantizer, centroid_indices):
-    """Reconstruct centroid vectors from the IVF quantizer."""
-    idx = np.asarray(centroid_indices, dtype="int64")
-    try:
-        return quantizer.reconstruct_batch(idx).astype("float32")
-    except (AttributeError, RuntimeError):
-        d = quantizer.d
-        vecs = np.empty((len(idx), d), dtype="float32")
-        for local_i, global_i in enumerate(idx):
-            vecs[local_i] = quantizer.reconstruct(int(global_i))
-        return vecs
-
-
-def toploc_ivf_search(
-    ivf_index,
-    q_emb,
-    cached_ids,
-    cached_vecs,
-    nprobe,
-    k,
-    search_timer=None,
-    total_timer=None,
-):
-    """
-    Returns D, I.
-    Optionally records two timings:
-      search_timer  -> ONLY search_preassigned (the fine step)
-      total_timer   -> scoring + selection + search (coarse + fine, fair vs baseline)
-    """
-    nq = q_emb.shape[0]
-    H = len(cached_ids)
-    actual_nprobe = min(nprobe, H)
-    use_ip = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
-
-    # ===== method_total starts here (coarse step) =====
-    t_total = time.perf_counter()
-
-    if use_ip:
-        all_scores = q_emb @ cached_vecs.T
-        top_local = np.argpartition(-all_scores, actual_nprobe, axis=1)[
-            :, :actual_nprobe
-        ]
-    else:
-        q_sq = np.sum(q_emb**2, axis=1, keepdims=True)
-        c_sq = np.sum(cached_vecs**2, axis=1).reshape(1, -1)
-        all_scores = q_sq + c_sq - 2.0 * (q_emb @ cached_vecs.T)
-        top_local = np.argpartition(all_scores, actual_nprobe, axis=1)[
-            :, :actual_nprobe
-        ]
-
-    sel_scores = np.ascontiguousarray(
-        np.take_along_axis(all_scores, top_local, axis=1), dtype="float32"
-    )
-    sel_ids = np.ascontiguousarray(cached_ids[top_local], dtype="int64")
-    q_c = np.ascontiguousarray(q_emb, dtype="float32")
-
-    old_nprobe = ivf_index.nprobe
-    ivf_index.nprobe = actual_nprobe
-
-    # ===== search_only times JUST this call (the fine step) =====
-    t_search = time.perf_counter()
-    D, I = ivf_index.search_preassigned(q_c, k, sel_ids, sel_scores)
-    search_ms = (time.perf_counter() - t_search) * 1000
-
-    ivf_index.nprobe = old_nprobe
-
-    total_ms = (time.perf_counter() - t_total) * 1000
-
-    if search_timer is not None:
-        search_timer.append(search_ms)
-    if total_timer is not None:
-        total_timer.append(total_ms)
-
-    return D, I
-
-
 # ================= LOAD INDEX =================
-print(f"Evaluating TopLoc-IVF for: {model_name} ({index_type})")
+print(f"Evaluating TopLoc-IVF (mega-batched) for: {model_name} ({index_type})")
 print(f"FAISS threads: {faiss.omp_get_max_threads()}")
 index_path = os.path.join(cache_dir, f"{index_type}_index.index")
 
@@ -189,12 +107,6 @@ else:
     base_index = faiss.read_index(index_path)
 
 ivf_index = faiss.extract_index_ivf(base_index)
-ivf_index.nprobe = NP
-
-try:
-    ivf_index.make_direct_map()
-except Exception:
-    pass
 
 print(
     f"Index loaded: ntotal={ivf_index.ntotal}, nlist={ivf_index.nlist}, "
@@ -202,8 +114,16 @@ print(
 )
 
 H = min(H_CACHED_CENTROIDS, ivf_index.nlist)
-if H != H_CACHED_CENTROIDS:
-    print(f"Reducing cached centroids to nlist: {H}")
+d = ivf_index.d
+USE_IP = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
+
+# ================= RECONSTRUCT ALL CENTROIDS ONCE =================
+print(f"Reconstructing all {ivf_index.nlist} centroids (one-time cost)...")
+t_recon = time.perf_counter()
+all_centroids = np.zeros((ivf_index.nlist, d), dtype="float32")
+for i in range(ivf_index.nlist):
+    all_centroids[i] = ivf_index.quantizer.reconstruct(i)
+print(f"  Done in {time.perf_counter() - t_recon:.1f}s — shape {all_centroids.shape}")
 
 # ================= LOAD ID MAPPING =================
 ids_path = os.path.join(cache_dir, f"{index_type}_ids.npy")
@@ -212,10 +132,8 @@ id_map = {str(i): str(pid) for i, pid in enumerate(id_array)}
 indexed_pids = set(id_map.values())
 
 # ================= LOAD TOPICS =================
-# Match baseline: split on first comma only, preserving commas in query text
 topics = {}
-topics_path = os.path.join(DATASET_DIR, "topics.tsv")
-with open(topics_path, "r", encoding="utf-8") as f:
+with open(os.path.join(DATASET_DIR, "topics.tsv"), "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line or line.startswith("#"):
@@ -223,12 +141,10 @@ with open(topics_path, "r", encoding="utf-8") as f:
         parts = line.split(",", 1)
         if len(parts) == 2:
             topics[parts[0].strip()] = parts[1].strip()
-
 if not topics:
     raise RuntimeError("Parsed 0 topics.")
 
 # ================= LOAD QRELS =================
-# Match baseline: qrels are comma-separated
 qrels = defaultdict(dict)
 with open(os.path.join(DATASET_DIR, "qrels.qrel"), "r", encoding="utf-8") as f:
     for line in f:
@@ -236,8 +152,7 @@ with open(os.path.join(DATASET_DIR, "qrels.qrel"), "r", encoding="utf-8") as f:
         if len(parts) != 4:
             continue
         qid, _, pid, score = parts
-        qid = qid.strip()
-        pid = pid.strip()
+        qid, pid = qid.strip(), pid.strip()
         try:
             score = int(score)
         except ValueError:
@@ -250,112 +165,184 @@ filtered_qrels = {
     for k, v in qrels.items()
     if any(p in indexed_pids for p in v)
 }
-
 if not filtered_qrels:
-    raise RuntimeError("No qrels survived filtering against indexed pids.")
+    raise RuntimeError("No qrels survived filtering.")
 
 # ================= GROUP TURNS BY CONVERSATION =================
 conversations = defaultdict(list)
 for turn_key in topics:
     conv_id = turn_key.split("_")[0]
     conversations[conv_id].append(turn_key)
-
 print(f"Grouped {len(topics)} turns into {len(conversations)} conversations")
 
-# ================= ENCODE ONCE + BUILD RUN (untimed) =================
+# ================= ENCODE ALL QUERIES ONCE =================
 print(f"\nLoading {model_name} query encoder...")
 encode_batch = load_query_encoder(model_name)
-print("Encoding queries and building run dict (untimed)...")
 
-conv_cache = {}  # conv_id -> cached centroid IDs (int64)
-conv_cvecs = {}  # conv_id -> pre-reconstructed centroid vectors (float32)
-conv_q0_emb = {}  # conv_id -> q0 embedding (only if q0 judged)
-conv_fu_embs = {}  # conv_id -> follow-up embeddings
-conv_fu_keys = {}  # conv_id -> follow-up turn keys
+# Encode ALL queries, build lookup
+all_turn_keys = list(topics.keys())
+all_turn_texts = [topics[k] for k in all_turn_keys]
+print(f"Encoding {len(all_turn_keys)} queries...")
+all_embs = encode_batch(all_turn_texts)  # (N_total, d)
+emb_lookup = {k: all_embs[i] for i, k in enumerate(all_turn_keys)}
+
 k = 10
+actual_nprobe = min(NP, H)
+
+# ================= BUILD RUN DICT (untimed, mega-batched) =================
+print("Building run dict (untimed)...")
 run = defaultdict(dict)
 
-for conv_id, turns in conversations.items():
-    q0_key = turns[0]
-    followup_keys = [t for t in turns[1:] if t in filtered_qrels]
+# ---- Organize conversations ----
+conv_ids_ordered = list(conversations.keys())
+conv_q0_keys = [conversations[cid][0] for cid in conv_ids_ordered]
+conv_q0_embs = np.array([emb_lookup[k] for k in conv_q0_keys], dtype="float32")
 
-    # ---- TURN 0: build cache (ALWAYS) + full search ----
-    q0_emb = encode_batch([topics[q0_key]])
-    _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
+# ---- Phase 1: ALL first turns batched ----
+# One quantizer.search → top-H centroids per conversation
+D_c, C_batch = ivf_index.quantizer.search(conv_q0_embs, H)  # (n_conv, H)
 
-    c0_ids = c0_indices[0].astype("int64")
-    c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_ids)
+# Store per-conversation cache (for follow-ups)
+conv_cache = {}  # conv_id -> (H,) centroid IDs
+conv_cvecs = {}  # conv_id -> (H, d) centroid vectors (from pre-reconstructed)
+for ci, conv_id in enumerate(conv_ids_ordered):
+    c_ids = C_batch[ci].astype("int64")
+    conv_cache[conv_id] = c_ids
+    conv_cvecs[conv_id] = all_centroids[
+        c_ids
+    ]  # zero-cost lookup into pre-reconstructed
 
-    conv_cache[conv_id] = c0_ids
-    conv_cvecs[conv_id] = c0_vecs
+# First-turn search: search_preassigned with top-NP of the H cached
+sel_ids_first = np.ascontiguousarray(C_batch[:, :actual_nprobe], dtype="int64")
+sel_dists_first = np.ascontiguousarray(D_c[:, :actual_nprobe], dtype="float32")
+ivf_index.nprobe = actual_nprobe
+D_first, I_first = ivf_index.search_preassigned(
+    conv_q0_embs, k, sel_ids_first, sel_dists_first
+)
 
-    scores_0, indices_0 = base_index.search(q0_emb, k)
-
+# Record judged first turns into run
+for ci, q0_key in enumerate(conv_q0_keys):
     if q0_key in filtered_qrels:
-        conv_q0_emb[conv_id] = q0_emb
-        for idx, score in zip(indices_0[0], scores_0[0]):
+        for idx, score in zip(I_first[ci], D_first[ci]):
             if idx >= 0 and id_map.get(str(idx)):
                 run[q0_key][id_map[str(idx)]] = float(score)
 
-    # ---- TURNS 1+: batched cached search ----
+# ---- Phase 2: ALL follow-ups mega-batched ----
+# Per-conversation: numpy coarse scoring against cached centroids
+# Then ONE search_preassigned for all follow-ups across all conversations
+conv_fu_keys = {}  # conv_id -> list of follow-up turn keys
+conv_fu_embs = {}  # conv_id -> (n_fu, d) embeddings
+all_fu_qids = []
+all_fu_embs_list = []
+all_a_ids_list = []
+all_a_dists_list = []
+
+for conv_id in conv_ids_ordered:
+    turns = conversations[conv_id]
+    followup_keys = [t for t in turns[1:] if t in filtered_qrels]
     if not followup_keys:
         continue
 
-    fu_embs = encode_batch([topics[tk] for tk in followup_keys])
-    conv_fu_embs[conv_id] = fu_embs
+    fu_embs = np.array([emb_lookup[k] for k in followup_keys], dtype="float32")
     conv_fu_keys[conv_id] = followup_keys
+    conv_fu_embs[conv_id] = fu_embs
 
-    scores_fu, indices_fu = toploc_ivf_search(
-        ivf_index, fu_embs, c0_ids, c0_vecs, NP, k
-    )
-    for row_idx, turn_key in enumerate(followup_keys):
-        for idx, score in zip(indices_fu[row_idx], scores_fu[row_idx]):
+    c_ids = conv_cache[conv_id]
+    c_vecs = conv_cvecs[conv_id]  # (H, d)
+
+    # Coarse scoring: numpy BLAS matrix multiply
+    if USE_IP:
+        scores = fu_embs @ c_vecs.T  # (n_fu, H)
+        top_local = np.argpartition(-scores, actual_nprobe, axis=1)[:, :actual_nprobe]
+    else:
+        q_sq = np.sum(fu_embs**2, axis=1, keepdims=True)
+        c_sq = np.sum(c_vecs**2, axis=1).reshape(1, -1)
+        scores = q_sq + c_sq - 2.0 * (fu_embs @ c_vecs.T)
+        top_local = np.argpartition(scores, actual_nprobe, axis=1)[:, :actual_nprobe]
+
+    a_ids = c_ids[top_local].astype("int64")
+    a_dists = np.take_along_axis(scores, top_local, axis=1).astype("float32")
+
+    all_fu_qids.extend(followup_keys)
+    all_fu_embs_list.append(fu_embs)
+    all_a_ids_list.append(a_ids)
+    all_a_dists_list.append(a_dists)
+
+# ONE mega-batch search_preassigned for ALL follow-ups
+if all_fu_qids:
+    mega_embs = np.ascontiguousarray(np.vstack(all_fu_embs_list), dtype="float32")
+    mega_ids = np.ascontiguousarray(np.vstack(all_a_ids_list), dtype="int64")
+    mega_dists = np.ascontiguousarray(np.vstack(all_a_dists_list), dtype="float32")
+
+    ivf_index.nprobe = actual_nprobe
+    D_fu, I_fu = ivf_index.search_preassigned(mega_embs, k, mega_ids, mega_dists)
+
+    for i, qid in enumerate(all_fu_qids):
+        for idx, score in zip(I_fu[i], D_fu[i]):
             if idx >= 0 and id_map.get(str(idx)):
-                run[turn_key][id_map[str(idx)]] = float(score)
+                run[qid][id_map[str(idx)]] = float(score)
 
-first_n = len(conv_q0_emb)
-followup_n = sum(len(v) for v in conv_fu_keys.values())
+first_n = sum(1 for k in conv_q0_keys if k in filtered_qrels)
+followup_n = len(all_fu_qids)
 
-# ================= COMPUTE METRICS (deterministic, untimed) =================
+# ================= COMPUTE METRICS =================
 print(f"\nDEBUG: I have {len(run)} turns in my run dict.")
-
 measures = [nDCG @ 3, nDCG @ k, RR @ k]
 results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
+# ================= TIMING: MEGA-BATCHED SWEEPS =================
+# Precompute the judged first-turn batch for timing
+judged_first_indices = [ci for ci, k in enumerate(conv_q0_keys) if k in filtered_qrels]
+judged_first_embs = np.ascontiguousarray(
+    conv_q0_embs[judged_first_indices], dtype="float32"
+)
 
-# ================= TIMING: PER-CONVERSATION SWEEP =================
+
 def timed_sweep():
-    first_total_ms = 0.0
-    fu_search_ms = 0.0  # search_preassigned only
-    fu_total_ms = 0.0  # scoring + selection + search
+    # ---- Phase 1: all judged first turns (ONE quantizer.search + ONE search_preassigned) ----
+    t0 = time.perf_counter()
+    D_c, C_ids = ivf_index.quantizer.search(judged_first_embs, H)
+    sel_ids = np.ascontiguousarray(C_ids[:, :actual_nprobe], dtype="int64")
+    sel_dists = np.ascontiguousarray(D_c[:, :actual_nprobe], dtype="float32")
+    ivf_index.nprobe = actual_nprobe
+    ivf_index.search_preassigned(judged_first_embs, k, sel_ids, sel_dists)
+    first_ms = (time.perf_counter() - t0) * 1000
 
-    for conv_id, turns in conversations.items():
-        if conv_id in conv_q0_emb:
-            q0_emb = conv_q0_emb[conv_id]
-            t0 = time.perf_counter()
-            ivf_index.quantizer.search(q0_emb, H)
-            base_index.search(q0_emb, k)
-            first_total_ms += (time.perf_counter() - t0) * 1000
+    # ---- Phase 2: all follow-ups (per-conv numpy scoring + ONE mega search_preassigned) ----
+    t0 = time.perf_counter()
+    fu_e_list, a_i_list, a_d_list = [], [], []
 
-        if conv_id in conv_fu_keys:
-            fu_embs = conv_fu_embs[conv_id]
-            c_ids = conv_cache[conv_id]
-            c_vecs = conv_cvecs[conv_id]
-            s_timer, t_timer = [], []
-            toploc_ivf_search(
-                ivf_index,
-                fu_embs,
-                c_ids,
-                c_vecs,
-                NP,
-                k,
-                search_timer=s_timer,
-                total_timer=t_timer,
-            )
-            fu_search_ms += sum(s_timer)
-            fu_total_ms += sum(t_timer)
+    for conv_id in conv_fu_keys:
+        fu_embs = conv_fu_embs[conv_id]
+        c_ids = conv_cache[conv_id]
+        c_vecs = conv_cvecs[conv_id]
 
-    return first_total_ms, fu_search_ms, fu_total_ms
+        if USE_IP:
+            scores = fu_embs @ c_vecs.T
+            top_local = np.argpartition(-scores, actual_nprobe, axis=1)[
+                :, :actual_nprobe
+            ]
+        else:
+            q_sq = np.sum(fu_embs**2, axis=1, keepdims=True)
+            c_sq = np.sum(c_vecs**2, axis=1).reshape(1, -1)
+            scores = q_sq + c_sq - 2.0 * (fu_embs @ c_vecs.T)
+            top_local = np.argpartition(scores, actual_nprobe, axis=1)[
+                :, :actual_nprobe
+            ]
+
+        fu_e_list.append(fu_embs)
+        a_i_list.append(c_ids[top_local].astype("int64"))
+        a_d_list.append(np.take_along_axis(scores, top_local, axis=1).astype("float32"))
+
+    m_embs = np.ascontiguousarray(np.vstack(fu_e_list), dtype="float32")
+    m_ids = np.ascontiguousarray(np.vstack(a_i_list), dtype="int64")
+    m_dists = np.ascontiguousarray(np.vstack(a_d_list), dtype="float32")
+
+    ivf_index.nprobe = actual_nprobe
+    ivf_index.search_preassigned(m_embs, k, m_ids, m_dists)
+    followup_ms = (time.perf_counter() - t0) * 1000
+
+    return first_ms, followup_ms
 
 
 def latency_stats(times_ms):
@@ -366,27 +353,26 @@ def latency_stats(times_ms):
 
 print(
     f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed "
-    f"per-conversation sweeps..."
+    f"mega-batched sweeps..."
 )
 for _ in range(BATCH_WARMUP_RUNS):
     timed_sweep()
 
-first_times, fu_search_times, fu_total_times = [], [], []
+first_times, followup_times = [], []
 for run_i in range(BATCH_TIMED_RUNS):
-    f_ms, s_ms, t_ms = timed_sweep()
+    f_ms, u_ms = timed_sweep()
     first_times.append(f_ms)
-    fu_search_times.append(s_ms)
-    fu_total_times.append(t_ms)
+    followup_times.append(u_ms)
+    f_pq = f_ms / first_n if first_n else float("nan")
+    u_pq = u_ms / followup_n if followup_n else float("nan")
     print(
-        f"  run {run_i+1}: first={f_ms/first_n:.3f} | "
-        f"follow-up search-only={s_ms/followup_n:.3f} | "
-        f"follow-up method-total={t_ms/followup_n:.3f}  ms/query"
+        f"  run {run_i + 1}: first-turn total={f_ms:7.2f} ms (per-query={f_pq:.3f}) | "
+        f"follow-up total={u_ms:7.2f} ms (per-query={u_pq:.3f})"
     )
 
 # ================= RESULTS =================
 f_min, f_med, f_mean = latency_stats(first_times)
-s_min, s_med, s_mean = latency_stats(fu_search_times)  # search_preassigned only
-t_min, t_med, t_mean = latency_stats(fu_total_times)  # scoring + selection + search
+u_min, u_med, u_mean = latency_stats(followup_times)
 
 
 def per_query_line(stats, n):
@@ -401,7 +387,8 @@ print(f"TOPLOC-IVF EVALUATION RESULTS ({index_type.upper()}, {model_name})")
 print("=" * 70)
 print(
     f"Turns evaluated: {first_n + followup_n}  "
-    f"({first_n} first-turn, {followup_n} follow-up, {len(conversations)} conversations)"
+    f"({first_n} first-turn, {followup_n} follow-up, "
+    f"{len(conversations)} conversations)"
 )
 print(f"NDCG@3:  {results[nDCG @ 3]:.4f}")
 print(f"NDCG@10: {results[nDCG @ k]:.4f}")
@@ -413,12 +400,8 @@ print(
 )
 print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
 print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
-print(
-    f"  follow-up SEARCH-ONLY per query: {per_query_line((s_min, s_med, s_mean), followup_n)}"
-)
-print(
-    f"  follow-up METHOD-TOTAL per query: {per_query_line((t_min, t_med, t_mean), followup_n)}"
-)
+print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
+print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
 print(f"\nCentroids cached per conv: {H}")
 print(f"nprobe:                    {NP}")
 print("=" * 70)
