@@ -130,8 +130,12 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
                     break
             train_data = np.concatenate(train_chunks)[:TRAIN_SAMPLE_SIZE]
             del train_chunks
+            # Show k-means progress (otherwise train() is silent for hours) and
+            # allow cutting the iteration count via KMEANS_NITER (default 25).
+            index.cp.niter = int(os.environ.get("KMEANS_NITER", 25))
+            index.cp.verbose = True
             log.info(f"[ivf] Training on {len(train_data):,} vectors "
-                     f"(FAISS needs >= {39 * num_centroids:,})...")
+                     f"(FAISS needs >= {39 * num_centroids:,}), niter={index.cp.niter}...")
             t0 = time.time()
             index.train(train_data)
             del train_data
