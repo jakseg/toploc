@@ -116,7 +116,12 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
             quantizer = faiss.IndexFlatIP(dim)
             index = faiss.IndexIVFFlat(quantizer, dim, num_centroids, faiss.METRIC_INNER_PRODUCT)
 
-            log.info(f"[ivf] Collecting training sample (target {TRAIN_SAMPLE_SIZE:,} vectors)...")
+            # FAISS wants >= 39 * num_centroids training points for well-formed
+            # centroids. Scale the sample to the codebook size so large ones
+            # (Dragon 2^18 -> ~10.5M) are not starved, while small ones
+            # (Snowflake 2^15) stay at the 2M floor.
+            train_target = max(TRAIN_SAMPLE_SIZE, 40 * num_centroids)
+            log.info(f"[ivf] Collecting training sample (target {train_target:,} vectors)...")
             shuffled = list(parquet_files)
             random.shuffle(shuffled)
             train_chunks = []
@@ -126,9 +131,9 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
                 faiss.normalize_L2(embs)
                 train_chunks.append(embs)
                 collected += len(embs)
-                if collected >= TRAIN_SAMPLE_SIZE:
+                if collected >= train_target:
                     break
-            train_data = np.concatenate(train_chunks)[:TRAIN_SAMPLE_SIZE]
+            train_data = np.concatenate(train_chunks)[:train_target]
             del train_chunks
             # Show k-means progress (otherwise train() is silent for hours) and
             # allow cutting the iteration count via KMEANS_NITER (default 25).
