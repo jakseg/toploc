@@ -160,8 +160,8 @@ encode_batch = load_query_encoder(model_name)
 print("Encoding queries and building run dict (untimed)...")
 
 conv_cache = {}  # conv_id -> cached centroid ids (int64)
-conv_cache_flat = {}  # NEW: conv_id -> pre-built FAISS flat index for centroids
-conv_cache_global_ids = {}  # NEW: conv_id -> array of global centroid IDs
+conv_cache_flat = {}  # conv_id -> pre-built FAISS flat index for centroids
+conv_cache_global_ids = {}  # conv_id -> array of global centroid IDs
 conv_q0_emb = {}  # conv_id -> q0 embedding (1, d)   [only if q0 judged]
 conv_fu_embs = {}  # conv_id -> follow-up embeddings (nq, d)
 conv_fu_keys = {}  # conv_id -> list of follow-up turn keys
@@ -180,7 +180,7 @@ for conv_id, turns in conversations.items():
     conv_cache[conv_id] = cached_centroid_ids
     conv_cache_global_ids[conv_id] = cached_centroid_ids
 
-    # NEW: Pre-compute the centroid vectors and build a flat index ONCE per conversation
+    # Pre-compute the centroid vectors and build a flat index ONCE per conversation
     cvecs = np.array(
         [ivf_index.quantizer.reconstruct(int(idx)) for idx in cached_centroid_ids],
         dtype="float32",
@@ -206,7 +206,7 @@ for conv_id, turns in conversations.items():
     conv_fu_embs[conv_id] = fu_embs
     conv_fu_keys[conv_id] = followup_keys
 
-    # NEW: Fast native FAISS Python search (replaces slow C++ wrapper)
+    # Fast native FAISS Python search
     flat_idx = conv_cache_flat[conv_id]
     global_centroid_ids = conv_cache_global_ids[conv_id]
 
@@ -218,13 +218,13 @@ for conv_id, turns in conversations.items():
         local_labels >= 0, global_centroid_ids[local_labels], -1
     ).astype("int64")
 
-    # 3. Run the restricted FAISS search
+    # 3. Run the restricted FAISS search (FIXED: using keyword arguments)
     params = faiss.IVFSearchParameters()
     params.nprobe = NP
     params.max_codes = 0
 
     scores_fu, indices_fu = base_index.search_preassigned(
-        fu_embs, k, global_coarse_labels, coarse_dists, False, params  # store_pairs
+        fu_embs, k, global_coarse_labels, coarse_dists, store_pairs=False, params=params
     )
 
     for row_idx, turn_key in enumerate(followup_keys):
@@ -261,7 +261,7 @@ def timed_sweep():
             global_centroid_ids = conv_cache_global_ids[conv_id]
 
             t0 = time.perf_counter()
-            # Native FAISS Python (same C++ BLAS under the hood, zero wrapper overhead)
+            # Native FAISS Python (FIXED: using keyword arguments)
             coarse_dists, local_labels = flat_idx.search(fu_embs, NP)
             global_coarse_labels = np.where(
                 local_labels >= 0, global_centroid_ids[local_labels], -1
@@ -272,7 +272,12 @@ def timed_sweep():
             params.max_codes = 0
 
             base_index.search_preassigned(
-                fu_embs, k, global_coarse_labels, coarse_dists, False, params
+                fu_embs,
+                k,
+                global_coarse_labels,
+                coarse_dists,
+                store_pairs=False,
+                params=params,
             )
             followup_total_ms += (time.perf_counter() - t0) * 1000
 
