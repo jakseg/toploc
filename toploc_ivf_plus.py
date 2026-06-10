@@ -316,7 +316,7 @@ for conv_id, turns in conversations.items():
             refresh_count += 1
 
         # C++ does centroid fetch + scoring + search_preassigned in one shot
-        scores, indices = toploc_ivf_search(
+        scores, indices = toploc_ivf_search_ptr(
             int(ivf_index.this),
             qj_emb,
             cache["c0"],
