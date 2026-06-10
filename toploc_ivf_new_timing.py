@@ -32,7 +32,9 @@ faiss.omp_set_num_threads(os.cpu_count() or 1)
 
 # ================= TOPLOC IVF IMPLEMENTATION =================
 class TopLocIVF:
-    def __init__(self, index, h=1024, nprobe=128):
+    def __init__(self, index, h=4096, nprobe=128):
+        self.top_index = index  # Retain for fallback
+
         if not isinstance(index, faiss.IndexIVF):
             self.ivf_index = faiss.downcast_index(index.index)
         else:
@@ -55,47 +57,48 @@ class TopLocIVF:
         self.cache = {}
 
     def search_first_turn(self, q_emb, conv_id, k):
+        # Ensure memory is contiguous to prevent FAISS copying overhead
+        q_emb = np.ascontiguousarray(q_emb, dtype=np.float32)
+
         # 1. Search full quantizer for top h centroids
         coarse_dis, coarse_assign = self.quantizer.search(q_emb, self.h)
 
         C0_ids = coarse_assign[0]
-        C0_vecs = self.all_centroids[C0_ids]
+        C0_vecs = np.ascontiguousarray(self.all_centroids[C0_ids], dtype=np.float32)
+
+        # 2. Build a native FAISS C++ index for the cache.
+        # This completely eliminates NumPy overhead and handles exact sorting natively.
+        c0_index = faiss.IndexFlatIP(self.d)
+        c0_index.add(C0_vecs)
 
         self.cache[conv_id] = {
             "C0_ids": C0_ids,
-            "C0_vecs": C0_vecs,
+            "c0_index": c0_index,
         }
 
-        # 2. Use top nprobe for the actual search
-        assign = coarse_assign[:, : self.nprobe].astype(np.int64)
-        c_dis = coarse_dis[:, : self.nprobe].astype(np.float32)
+        # 3. Use top nprobe for the actual preassigned search
+        assign = np.ascontiguousarray(coarse_assign[:, : self.nprobe], dtype=np.int64)
+        c_dis = np.ascontiguousarray(coarse_dis[:, : self.nprobe], dtype=np.float32)
 
-        # FIX: Use the 4-argument signature that works on your machine
         distances, labels = self.ivf_index.search_preassigned(q_emb, k, assign, c_dis)
         return distances, labels
 
     def search_followup(self, q_batch, conv_id, k):
         cached = self.cache.get(conv_id)
         if cached is None:
-            return self.ivf_index.search(q_batch, k)
+            return self.top_index.search(q_batch, k)
 
-        C0_ids = cached["C0_ids"]
-        C0_vecs = cached["C0_vecs"]
+        q_batch = np.ascontiguousarray(q_batch, dtype=np.float32)
 
-        # 1. Fast NumPy Dot Product against ONLY cached centroids
-        sims = q_batch @ C0_vecs.T
+        # 1. Bypass the massive quantizer matrix. Search ONLY the h cached centroids using C++
+        c_dis, sub_assign = cached["c0_index"].search(q_batch, self.nprobe)
 
-        # FIX: Use argpartition instead of argsort for massive speedup
-        top_local_idx = np.argpartition(-sims, self.nprobe, axis=1)[:, : self.nprobe]
+        # 2. Map local 0-to-h index back to global centroid IDs
+        assign = np.ascontiguousarray(cached["C0_ids"][sub_assign], dtype=np.int64)
+        c_dis = np.ascontiguousarray(c_dis, dtype=np.float32)
 
-        # 2. Map back to global IDs and grab distances
-        assign = C0_ids[top_local_idx].astype(np.int64)
-        coarse_dis = np.take_along_axis(sims, top_local_idx, axis=1).astype(np.float32)
-
-        # FIX: Use the 4-argument signature
-        distances, labels = self.ivf_index.search_preassigned(
-            q_batch, k, assign, coarse_dis
-        )
+        # 3. Preassigned FAISS scan
+        distances, labels = self.ivf_index.search_preassigned(q_batch, k, assign, c_dis)
 
         return distances, labels
 
@@ -189,10 +192,11 @@ followup_rows_per_conv = [rows[1:] for rows in conv_rows.values()]
 first_n = len(first_rows)
 followup_n = sum(len(r) for r in followup_rows_per_conv)
 
-k = 10  # MATCH BASELINE
+k = 10
 
 # ================= WRAP INDEX IN TOPLOC =================
-toploc = TopLocIVF(index, h=1024, nprobe=128)
+# Set h=4096 per the paper's grid search to ensure we maintain exact NDCG bounds
+toploc = TopLocIVF(index, h=4096, nprobe=128)
 
 # ================= BUILD RUN (untimed) =================
 print("\nBuilding run dict for metrics...")
@@ -266,6 +270,8 @@ for run_i in range(BATCH_TIMED_RUNS):
 # ================= RESULTS =================
 f_min, f_med, f_mean = latency_stats(first_times)
 u_min, u_med, u_mean = latency_stats(followup_times)
+overall_times = [f + u for f, u in zip(first_times, followup_times)]
+o_min, o_med, o_mean = latency_stats(overall_times)
 
 
 def per_query_line(stats, n):
@@ -284,4 +290,5 @@ print()
 print(f"Latency (min / median / mean over {BATCH_TIMED_RUNS} sweeps):")
 print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
 print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
+print(f"  overall    per query: {per_query_line((o_min, o_med, o_mean), N)}")
 print("=" * 70)
