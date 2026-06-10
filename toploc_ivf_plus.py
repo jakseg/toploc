@@ -1,27 +1,13 @@
 #!/usr/bin/env python3
 """
-TopLoc-IVF+ evaluation (topical-locality centroid caching WITH refresh).
+TopLoc-IVF+ evaluation — matching toploc_ivf.py output format.
 
-Same as TopLoc-IVF, but the cached "hot" centroid set C0 is refreshed whenever
-the conversation drifts away from its starting topic. Drift is detected with the
-cheap I0 proxy from the paper:
-
-    I0 = | top_np(qj, C0)  ∩  top_np(q0, C0) |
-
-When |I0| falls below alpha * np, a refresh is triggered: C0 is recomputed from
-the current utterance and that utterance becomes the new reference q0.
+IVF+ adds a drift-detection mechanism: when the I0 overlap drops below
+alpha * nprobe, the centroid cache is refreshed from the current query.
 
 Run:
     python3 toploc_ivf_plus.py snowflake ivf
-    python3 toploc_ivf_plus.py dragon    ivf
-
-Env vars:
-    CACHE_BASE   base dir holding <model>/<index>_index.index and _ids.npy
-    DATASET_DIR  dir holding topics.tsv and qrels.qrel
-    MMAP=1       memory-map the index (set this if you get "Killed" = OOM)
-    H_CACHED     number of cached centroids h        (default 1024)
-    NP           nprobe                              (default 8)
-    ALPHA        refresh threshold fraction of np    (default 0.1)
+    NP=8  ALPHA=0.1  python3 toploc_ivf_plus.py snowflake ivf
 """
 
 import os
@@ -32,14 +18,13 @@ import faiss
 from collections import defaultdict
 import ir_measures
 from ir_measures import nDCG, RR
-from toploc_search import toploc_ivf_search, toploc_ivf_search_ptr  # ← C++ version
+from toploc_search import toploc_ivf_search_ptr
 
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
     "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
 )
-
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
     "dragon": os.path.join(CACHE_BASE, "dragon"),
@@ -49,121 +34,106 @@ model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 index_type = sys.argv[2] if len(sys.argv) > 2 else "ivf"
 cache_dir = CACHE_DIRS[model_name]
 
-# TopLoc-IVF+ hyperparameters (paper Section 3)
-H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))  # h ∈ {512,1024,4096,8192}
-NP = int(
-    os.environ.get("NP", 8)
-)  # nprobe — see note below; q0 full search uses this too
-ALPHA = float(os.environ.get("ALPHA", 0.1))  # α ∈ {0.0,0.05,0.1,0.2}
-
+H_CACHED_CENTROIDS = int(os.environ.get("H_CACHED", 1024))
+NP = int(os.environ.get("NP", 128))
+ALPHA = float(os.environ.get("ALPHA", 0.1))
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 
-# faiss.omp_set_num_threads(1)  # uncomment for single-threaded reproducible timing
+BATCH_WARMUP_RUNS = 2
+BATCH_TIMED_RUNS = 5
+
+faiss.omp_set_num_threads(os.cpu_count() or 1)
 
 
-# ================= QUERY ENCODER =================
+# ================= QUERY ENCODER (Batched) =================
 def load_query_encoder(model_name):
     if model_name == "snowflake":
         from sentence_transformers import SentenceTransformer
 
         model = SentenceTransformer("Snowflake/snowflake-arctic-embed-l-v2.0")
 
-        def encode(query):
+        def encode_batch(queries):
             return model.encode(
-                [query],
+                queries,
                 prompt_name="query",
                 normalize_embeddings=True,
                 convert_to_numpy=True,
             ).astype("float32")
 
-        return encode
-
+        return encode_batch
     elif model_name == "dragon":
         import torch
         from transformers import AutoTokenizer, AutoModel
 
         tokenizer = AutoTokenizer.from_pretrained("facebook/dragon-plus-query-encoder")
-        model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
-        model.eval()
+        enc_model = AutoModel.from_pretrained("facebook/dragon-plus-query-encoder")
+        enc_model.eval()
 
-        def encode(query):
-            tokens = tokenizer(
-                [query],
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            with torch.no_grad():
-                emb = torch.nn.functional.normalize(
-                    model(**tokens).last_hidden_state[:, 0, :], p=2, dim=1
+        def encode_batch(queries, chunk=32):
+            outs = []
+            for i in range(0, len(queries), chunk):
+                batch = queries[i : i + chunk]
+                tokens = tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
                 )
-            return emb.cpu().numpy().astype("float32")
+                with torch.no_grad():
+                    emb = torch.nn.functional.normalize(
+                        enc_model(**tokens).last_hidden_state[:, 0, :], p=2, dim=1
+                    )
+                outs.append(emb.cpu().numpy())
+            return np.vstack(outs).astype("float32")
 
-        return encode
-
+        return encode_batch
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
 
-# ================= TOPLOC IVF+ HELPERS =================
+# ================= IVF+ HELPERS =================
 def get_centroid_vectors(quantizer, centroid_indices):
-    """Fetch centroid vectors from the IVF quantizer, batched.
-    Still needed in IVF+ for the I0 drift check (rank_within_cache).
-    NOT needed in plain IVF — the C++ function handles it there.
-    """
     idx = np.asarray(centroid_indices, dtype="int64")
     try:
         return quantizer.reconstruct_batch(idx).astype("float32")
     except (AttributeError, RuntimeError):
         d = quantizer.d
         vecs = np.empty((len(idx), d), dtype="float32")
-        for local_i, global_i in enumerate(idx):
-            vecs[local_i] = quantizer.reconstruct(int(global_i))
+        for li, gi in enumerate(idx):
+            vecs[li] = quantizer.reconstruct(int(gi))
         return vecs
 
 
 def rank_within_cache(centroid_vecs, q_emb, nprobe, use_ip):
-    """Return the local indices of the top-nprobe cached centroids for q_emb,
-    plus the coarse scores for ALL cached centroids (reused by the I0 proxy).
-    This is Python-only and only used for the drift check — NOT for the search.
-    """
     if use_ip:
-        coarse = (centroid_vecs @ q_emb.T).reshape(-1)  # higher = closer
+        coarse = (centroid_vecs @ q_emb.T).reshape(-1)
         order = np.argsort(-coarse)
     else:
-        coarse = ((centroid_vecs - q_emb) ** 2).sum(axis=1)  # lower = closer
+        coarse = ((centroid_vecs - q_emb) ** 2).sum(axis=1)
         order = np.argsort(coarse)
     return order[:nprobe], coarse
 
 
-# ================= REMOVED =================
-# toploc_ivf_search() Python version — deleted.
-# Replaced by the C++ version imported from toploc_search.
-# Note: C++ version signature is:
-#   toploc_ivf_search(index, q_emb, cached_ids, nprobe, k)
-# It handles centroid fetching + scoring + search_preassigned internally.
-
-
 # ================= LOAD INDEX =================
 print(f"Evaluating TopLoc-IVF+ for: {model_name} ({index_type})")
+print(f"FAISS threads: {faiss.omp_get_max_threads()}")
 index_path = os.path.join(cache_dir, f"{index_type}_index.index")
 
 if USE_MMAP:
-    print("Loading index with mmap (IO_FLAG_MMAP) to keep RAM usage low...")
     base_index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
 else:
     base_index = faiss.read_index(index_path)
 
 ivf_index = faiss.extract_index_ivf(base_index)
 ivf_index.nprobe = NP
+USE_IP = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
 
 try:
     ivf_index.make_direct_map()
 except Exception:
     pass
 
-USE_IP = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
 print(
     f"Index loaded: ntotal={ivf_index.ntotal}, nlist={ivf_index.nlist}, "
     f"metric={'IP' if USE_IP else 'L2'}"
@@ -180,7 +150,6 @@ id_map = {str(i): str(pid) for i, pid in enumerate(id_array)}
 indexed_pids = set(id_map.values())
 
 # ================= LOAD TOPICS =================
-# Match baseline: split on first comma only, preserving commas in query text
 topics = {}
 with open(os.path.join(DATASET_DIR, "topics.tsv"), "r", encoding="utf-8") as f:
     for line in f:
@@ -190,12 +159,10 @@ with open(os.path.join(DATASET_DIR, "topics.tsv"), "r", encoding="utf-8") as f:
         parts = line.split(",", 1)
         if len(parts) == 2:
             topics[parts[0].strip()] = parts[1].strip()
-
 if not topics:
-    raise RuntimeError("Parsed 0 topics. Check the delimiter/format of topics.tsv.")
+    raise RuntimeError("Parsed 0 topics.")
 
 # ================= LOAD QRELS =================
-# Match baseline: qrels are comma-separated
 qrels = defaultdict(dict)
 with open(os.path.join(DATASET_DIR, "qrels.qrel"), "r", encoding="utf-8") as f:
     for line in f:
@@ -203,8 +170,7 @@ with open(os.path.join(DATASET_DIR, "qrels.qrel"), "r", encoding="utf-8") as f:
         if len(parts) != 4:
             continue
         qid, _, pid, score = parts
-        qid = qid.strip()
-        pid = pid.strip()
+        qid, pid = qid.strip(), pid.strip()
         try:
             score = int(score)
         except ValueError:
@@ -217,145 +183,236 @@ filtered_qrels = {
     for k, v in qrels.items()
     if any(p in indexed_pids for p in v)
 }
-
 if not filtered_qrels:
-    raise RuntimeError("No qrels survived filtering against indexed pids.")
+    raise RuntimeError("No qrels survived filtering.")
 
 # ================= GROUP TURNS BY CONVERSATION =================
 conversations = defaultdict(list)
 for turn_key in topics:
     conv_id = turn_key.split("_")[0]
     conversations[conv_id].append(turn_key)
-
 print(f"Grouped {len(topics)} turns into {len(conversations)} conversations")
 
-# ================= EVALUATION LOOP =================
+# ================= ENCODE ALL QUERIES ONCE =================
 print(f"\nLoading {model_name} query encoder...")
-encode_query = load_query_encoder(model_name)
-print(f"Running TopLoc-IVF+ evaluation (h={H}, alpha={ALPHA}, np={NP})...")
+encode_batch = load_query_encoder(model_name)
+all_turn_keys = list(topics.keys())
+print(f"Encoding {len(all_turn_keys)} queries...")
+all_embs = encode_batch([topics[k] for k in all_turn_keys])
+emb_lookup = {
+    k: all_embs[i : i + 1] for i, k in enumerate(all_turn_keys)
+}  # (1, d) each
 
-conv_cache = {}
-k, warmup = 10, 5
-times = []
-evaluated_turns = 0
-refresh_count = 0
+# Retrieval depth: 1000 to match paper methodology, metrics measured @3/@10
+RETRIEVE_K = 1000
+METRIC_K = 10
 
-# collect results for ir_measures — same pattern as baseline
+# ================= BUILD RUN DICT (untimed) =================
+print("Building run dict (untimed)...")
 run = defaultdict(dict)
+
+# Store initial cache state per conversation (for timed sweep resets)
+initial_cache = {}  # conv_id -> {"c0": ..., "c0_vecs": ..., "top_0_local": ...}
+conv_fu_keys = {}  # conv_id -> list of judged follow-up keys
+refresh_count = 0
 
 for conv_id, turns in conversations.items():
     q0_key = turns[0]
+    q0_emb = emb_lookup[q0_key]
 
-    # ---- TURN 0: full search + build initial cache (ALWAYS RUN) ----
-    # The cache (c0_vecs / top_0_local) must be built even when q0 is unjudged,
-    # because the follow-up turns of this conversation depend on it. Only the
-    # timing + run recording below are gated on q0 being judged.
-    q0_emb = encode_query(topics[q0_key])
-    start = time.perf_counter()
+    # ---- TURN 0: build initial cache (ALWAYS) + full search ----
     _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
-
-    # compute once and store — never recompute until refresh
-    c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_indices[0])
+    c0_ids = c0_indices[0].astype("int64")
+    c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_ids)
     top_0_local, _ = rank_within_cache(c0_vecs, q0_emb, NP, USE_IP)
 
-    conv_cache[conv_id] = {
-        "c0": c0_indices[0].astype("int64"),
-        "q0_emb": q0_emb,
-        "c0_vecs": c0_vecs,  # saved — no recompute per turn
-        "top_0_local": top_0_local,  # saved — no recompute per turn
+    # Save initial cache (before any refreshes)
+    initial_cache[conv_id] = {
+        "c0": c0_ids.copy(),
+        "c0_vecs": c0_vecs.copy(),
+        "top_0_local": top_0_local.copy(),
     }
 
-    scores, indices = base_index.search(q0_emb, k)
-    end = time.perf_counter()
+    # Working cache (will be modified by refreshes)
+    cache = {
+        "c0": c0_ids,
+        "c0_vecs": c0_vecs,
+        "top_0_local": top_0_local,
+    }
+
+    scores_0, indices_0 = base_index.search(q0_emb, RETRIEVE_K)
 
     if q0_key in filtered_qrels:
-        if evaluated_turns >= warmup:
-            times.append((end - start) * 1000)
+        for idx, score in zip(indices_0[0], scores_0[0]):
+            if idx >= 0 and id_map.get(str(idx)):
+                run[q0_key][id_map[str(idx)]] = float(score)
 
-        for idx, score in zip(indices[0], scores[0]):
-            if idx < 0:
-                continue
-            pid = id_map.get(str(idx))
-            if pid is not None:
-                run[q0_key][pid] = float(score)
+    # ---- TURNS 1+: drift check + restricted search ----
+    followup_keys = [t for t in turns[1:] if t in filtered_qrels]
+    if followup_keys:
+        conv_fu_keys[conv_id] = followup_keys
 
-        evaluated_turns += 1
-
-    # ---- TURNS 1+: I0 proxy -> conditional refresh -> C++ restricted search ----
     for turn_key in turns[1:]:
         if turn_key not in filtered_qrels:
             continue
 
-        qj_emb = encode_query(topics[turn_key])
-        start = time.perf_counter()
-        cache = conv_cache[conv_id]
+        qj_emb = emb_lookup[turn_key]
+        top_j_local, _ = rank_within_cache(cache["c0_vecs"], qj_emb, NP, USE_IP)
+        i0_size = len(np.intersect1d(top_j_local, cache["top_0_local"]))
 
-        # read from cache — no recomputing
-        c0_vecs = cache["c0_vecs"]
-        top_0_local = cache["top_0_local"]
-
-        # only qj needs computing — it's new every turn
-        top_j_local, _ = rank_within_cache(c0_vecs, qj_emb, NP, USE_IP)
-
-        # I0 proxy: overlap between top-np for qj and top-np for q0 within C0
-        i0_size = len(np.intersect1d(top_j_local, top_0_local))
-
-        # refresh when conversation has drifted
         if i0_size < ALPHA * NP:
             _, new_c0 = ivf_index.quantizer.search(qj_emb, H)
-            new_c0_vecs = get_centroid_vectors(ivf_index.quantizer, new_c0[0])
+            new_c0_ids = new_c0[0].astype("int64")
+            new_c0_vecs = get_centroid_vectors(ivf_index.quantizer, new_c0_ids)
             new_top_0, _ = rank_within_cache(new_c0_vecs, qj_emb, NP, USE_IP)
-
             cache = {
-                "c0": new_c0[0].astype("int64"),
-                "q0_emb": qj_emb,
-                "c0_vecs": new_c0_vecs,  # saved for future turns
-                "top_0_local": new_top_0,  # saved for future turns
+                "c0": new_c0_ids,
+                "c0_vecs": new_c0_vecs,
+                "top_0_local": new_top_0,
             }
-            conv_cache[conv_id] = cache
             refresh_count += 1
 
-        # C++ does centroid fetch + scoring + search_preassigned in one shot
         scores, indices = toploc_ivf_search_ptr(
-            int(ivf_index.this),
-            qj_emb,
-            cache["c0"],
-            NP,
-            k,
+            int(ivf_index.this), qj_emb, cache["c0"], NP, RETRIEVE_K
         )
-        end = time.perf_counter()
 
-        if evaluated_turns >= warmup:
-            times.append((end - start) * 1000)
-
-        # build run dict for ir_measures
         for idx, score in zip(indices[0], scores[0]):
-            if idx < 0:
-                continue
-            pid = id_map.get(str(idx))
-            if pid is not None:
-                run[turn_key][pid] = float(score)
+            if idx >= 0 and id_map.get(str(idx)):
+                run[turn_key][id_map[str(idx)]] = float(score)
 
-        evaluated_turns += 1
+first_n = sum(
+    1 for k in [conversations[c][0] for c in conversations] if k in filtered_qrels
+)
+followup_n = sum(len(v) for v in conv_fu_keys.values())
 
-# ================= COMPUTE METRICS WITH ir_measures =================
-# Sanity check to compare with the baseline run dict
+# ================= COMPUTE METRICS =================
 print(f"\nDEBUG: I have {len(run)} turns in my run dict.")
+print(f"DEBUG: Cache refreshes during run-building: {refresh_count}")
 
-measures = [nDCG @ 3, nDCG @ k, RR @ k]
+measures = [nDCG @ 3, nDCG @ METRIC_K, RR @ METRIC_K]
 results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
+
+# ================= TIMING: PER-CONVERSATION SWEEP =================
+# IVF+ is sequential (drift check depends on previous turns), so we
+# reset the cache to initial state at the start of each sweep.
+def timed_sweep():
+    first_total_ms, followup_total_ms = 0.0, 0.0
+    sweep_refreshes = 0
+
+    for conv_id, turns in conversations.items():
+        q0_key = turns[0]
+        q0_emb = emb_lookup[q0_key]
+
+        # Reset cache to initial state for this conversation
+        ic = initial_cache[conv_id]
+        cache = {
+            "c0": ic["c0"].copy(),
+            "c0_vecs": ic["c0_vecs"],  # read-only, no copy needed
+            "top_0_local": ic["top_0_local"],  # read-only, no copy needed
+        }
+
+        # Time q0 only if judged
+        if q0_key in filtered_qrels:
+            t0 = time.perf_counter()
+            ivf_index.quantizer.search(q0_emb, H)
+            base_index.search(q0_emb, RETRIEVE_K)
+            first_total_ms += (time.perf_counter() - t0) * 1000
+
+        # Follow-ups: sequential with drift check
+        for turn_key in turns[1:]:
+            if turn_key not in filtered_qrels:
+                continue
+
+            qj_emb = emb_lookup[turn_key]
+            t0 = time.perf_counter()
+
+            top_j_local, _ = rank_within_cache(cache["c0_vecs"], qj_emb, NP, USE_IP)
+            i0_size = len(np.intersect1d(top_j_local, cache["top_0_local"]))
+
+            if i0_size < ALPHA * NP:
+                _, new_c0 = ivf_index.quantizer.search(qj_emb, H)
+                new_c0_ids = new_c0[0].astype("int64")
+                new_c0_vecs = get_centroid_vectors(ivf_index.quantizer, new_c0_ids)
+                new_top_0, _ = rank_within_cache(new_c0_vecs, qj_emb, NP, USE_IP)
+                cache = {
+                    "c0": new_c0_ids,
+                    "c0_vecs": new_c0_vecs,
+                    "top_0_local": new_top_0,
+                }
+                sweep_refreshes += 1
+
+            toploc_ivf_search_ptr(
+                int(ivf_index.this), qj_emb, cache["c0"], NP, RETRIEVE_K
+            )
+            followup_total_ms += (time.perf_counter() - t0) * 1000
+
+    return first_total_ms, followup_total_ms, sweep_refreshes
+
+
+def latency_stats(times_ms):
+    if not times_ms:
+        return float("nan"), float("nan"), float("nan")
+    return min(times_ms), float(np.median(times_ms)), float(np.mean(times_ms))
+
+
+print(
+    f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed "
+    f"per-conversation sweeps..."
+)
+for _ in range(BATCH_WARMUP_RUNS):
+    timed_sweep()
+
+first_times, followup_times = [], []
+total_sweep_refreshes = 0
+for run_i in range(BATCH_TIMED_RUNS):
+    f_ms, u_ms, sr = timed_sweep()
+    first_times.append(f_ms)
+    followup_times.append(u_ms)
+    total_sweep_refreshes += sr
+    f_pq = f_ms / first_n if first_n else float("nan")
+    u_pq = u_ms / followup_n if followup_n else float("nan")
+    print(
+        f"  run {run_i + 1}: first-turn total={f_ms:7.2f} ms (per-query={f_pq:.3f}) | "
+        f"follow-up total={u_ms:7.2f} ms (per-query={u_pq:.3f}) | "
+        f"refreshes={sr}"
+    )
+
 # ================= RESULTS =================
-print("\n" + "=" * 60)
+f_min, f_med, f_mean = latency_stats(first_times)
+u_min, u_med, u_mean = latency_stats(followup_times)
+
+
+def per_query_line(stats, n):
+    lo, md, mn = stats
+    if not n:
+        return "n/a"
+    return f"{lo / n:8.3f}  /  {md / n:8.3f}  /  {mn / n:8.3f}  ms"
+
+
+print("\n" + "=" * 70)
 print(f"TOPLOC-IVF+ EVALUATION RESULTS ({index_type.upper()}, {model_name})")
-print("=" * 60)
-print(f"Turns evaluated:           {evaluated_turns}")
-print(f"NDCG@3:                    {results[nDCG @ 3]:.4f}")
-print(f"NDCG@10:                   {results[nDCG @ k]:.4f}")
-print(f"MRR@10:                    {results[RR @ k]:.4f}")
-print(f"Avg Time:                  {np.mean(times) if times else float('nan'):.2f} ms")
-print(f"Centroids cached per conv: {H}")
+print("=" * 70)
+print(
+    f"Turns evaluated: {first_n + followup_n}  "
+    f"({first_n} first-turn, {followup_n} follow-up, "
+    f"{len(conversations)} conversations)"
+)
+print(f"NDCG@3:  {results[nDCG @ 3]:.4f}")
+print(f"NDCG@10: {results[nDCG @ METRIC_K]:.4f}")
+print(f"MRR@10:  {results[RR @ METRIC_K]:.4f}")
+print()
+print(
+    f"Latency, summed over conversations (min / median / mean over "
+    f"{BATCH_TIMED_RUNS} sweeps):"
+)
+print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
+print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
+print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
+print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
+print(f"\nCentroids cached per conv: {H}")
 print(f"nprobe:                    {NP}")
-print(f"Alpha threshold (alpha):   {ALPHA}")
-print(f"Cache refreshes triggered: {refresh_count}")
-print("=" * 60)
+print(f"Alpha threshold:           {ALPHA}")
+print(f"Cache refreshes (run):     {refresh_count}")
+print(f"Cache refreshes (avg sweep): {total_sweep_refreshes / BATCH_TIMED_RUNS:.0f}")
+print("=" * 70)

@@ -182,7 +182,7 @@ conv_cache = {}  # conv_id -> cached centroid ids (int64)
 conv_q0_emb = {}  # conv_id -> q0 embedding (1, d)   [only if q0 judged]
 conv_fu_embs = {}  # conv_id -> follow-up embeddings (nq, d)
 conv_fu_keys = {}  # conv_id -> list of follow-up turn keys
-k = 10
+k = 1000
 run = defaultdict(dict)
 
 for conv_id, turns in conversations.items():
