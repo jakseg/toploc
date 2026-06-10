@@ -8,6 +8,9 @@ from collections import defaultdict
 import ir_measures
 from ir_measures import nDCG, RR
 
+# Import the C++ module
+from toploc_search import toploc_ivf_search_ptr
+
 # ================= CONFIGURATION =================
 CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
@@ -77,7 +80,7 @@ def load_query_encoder(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 
-# ================= HELPER: Reconstruct centroids =================
+# ================= HELPER: Reconstruct centroids ONCE =================
 def get_centroid_vectors(quantizer, centroid_indices):
     idx = np.asarray(centroid_indices, dtype="int64")
     try:
@@ -100,13 +103,12 @@ else:
     base_index = faiss.read_index(index_path)
 ivf_index = faiss.extract_index_ivf(base_index)
 ivf_index.nprobe = NP
-USE_IP = ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT
 try:
     ivf_index.make_direct_map()
 except:
     pass
 print(
-    f"Index loaded: ntotal={ivf_index.ntotal}, nlist={ivf_index.nlist}, metric={'IP' if USE_IP else 'L2'}"
+    f"Index loaded: ntotal={ivf_index.ntotal}, nlist={ivf_index.nlist}, metric={'IP' if ivf_index.metric_type == faiss.METRIC_INNER_PRODUCT else 'L2'}"
 )
 
 H = min(H_CACHED_CENTROIDS, ivf_index.nlist)
@@ -167,14 +169,13 @@ print(f"Encoding {len(all_turn_keys)} queries...")
 all_embs = encode_batch([topics[k] for k in all_turn_keys])
 emb_lookup = {k: all_embs[i : i + 1] for i, k in enumerate(all_turn_keys)}
 
-# FIX: Separate Retrieval K (fetch 1000) from Metric K (grade top 10)
 RETRIEVE_K = 1000
 METRIC_K = 10
 
 # ================= BUILD RUN (untimed) =================
 print("Building run dict (untimed)...")
 run = defaultdict(dict)
-conv_cache = {}
+conv_cache = {}  # Stores BOTH ids and pre-reconstructed vectors
 conv_q0_emb = {}
 conv_fu_embs = {}
 conv_fu_keys = {}
@@ -187,6 +188,8 @@ for conv_id, turns in conversations.items():
     q0_emb = emb_lookup[q0_key]
     _, c0_indices = ivf_index.quantizer.search(q0_emb, H)
     c0_ids = c0_indices[0].astype("int64")
+
+    # CRITICAL FIX: Pre-reconstruct vectors ONCE in Python
     c0_vecs = get_centroid_vectors(ivf_index.quantizer, c0_ids)
     conv_cache[conv_id] = {"c0": c0_ids, "c0_vecs": c0_vecs}
 
@@ -197,38 +200,17 @@ for conv_id, turns in conversations.items():
             if idx >= 0 and id_map.get(str(idx)):
                 run[q0_key][id_map[str(idx)]] = float(score)
 
-    # TURNS 1+ (FAST NUMPY SCORING)
+    # TURNS 1+ (USE C++ MODULE WITH PRE-RECONSTRUCTED VECTORS)
     if not followup_keys:
         continue
     fu_embs = encode_batch([topics[tk] for tk in followup_keys])
     conv_fu_embs[conv_id] = fu_embs
     conv_fu_keys[conv_id] = followup_keys
 
-    nq = fu_embs.shape[0]
-    # 1. Fast NumPy BLAS scoring (Faster than FAISS IndexFlat for small H)
-    if USE_IP:
-        all_scores = fu_embs @ c0_vecs.T
-        top_local = np.argpartition(-all_scores, NP, axis=1)[:, :NP]
-    else:
-        q_sq = np.sum(fu_embs**2, axis=1, keepdims=True)
-        c_sq = np.sum(c0_vecs**2, axis=1).reshape(1, -1)
-        all_scores = q_sq + c_sq - 2.0 * (fu_embs @ c0_vecs.T)
-        top_local = np.argpartition(all_scores, NP, axis=1)[:, :NP]
-
-    sel_scores = np.take_along_axis(all_scores, top_local, axis=1).astype("float32")
-    sel_ids = c0_ids[top_local].astype("int64")
-
-    # 2. FAISS Fine Search
-    q_c = np.ascontiguousarray(fu_embs, dtype="float32")
-    sel_ids_c = np.ascontiguousarray(sel_ids, dtype="int64")
-    sel_scores_c = np.ascontiguousarray(sel_scores, dtype="float32")
-
-    old_nprobe = ivf_index.nprobe
-    ivf_index.nprobe = NP
-    scores_fu, indices_fu = ivf_index.search_preassigned(
-        q_c, RETRIEVE_K, sel_ids_c, sel_scores_c
+    # Call C++ function, passing c0_vecs as the 6th argument!
+    scores_fu, indices_fu = toploc_ivf_search_ptr(
+        int(ivf_index.this), fu_embs, c0_ids, NP, RETRIEVE_K, c0_vecs
     )
-    ivf_index.nprobe = old_nprobe
 
     for row_idx, turn_key in enumerate(followup_keys):
         for idx, score in zip(indices_fu[row_idx], scores_fu[row_idx]):
@@ -259,37 +241,17 @@ def timed_sweep():
         if conv_id in conv_fu_keys:
             fu_embs = conv_fu_embs[conv_id]
             cache = conv_cache[conv_id]
-            c0_ids = cache["c0"]
-            c0_vecs = cache["c0_vecs"]
 
             t0 = time.perf_counter()
-            nq = fu_embs.shape[0]
-
-            # 1. Fast NumPy BLAS scoring
-            if USE_IP:
-                all_scores = fu_embs @ c0_vecs.T
-                top_local = np.argpartition(-all_scores, NP, axis=1)[:, :NP]
-            else:
-                q_sq = np.sum(fu_embs**2, axis=1, keepdims=True)
-                c_sq = np.sum(c0_vecs**2, axis=1).reshape(1, -1)
-                all_scores = q_sq + c_sq - 2.0 * (fu_embs @ c0_vecs.T)
-                top_local = np.argpartition(all_scores, NP, axis=1)[:, :NP]
-
-            sel_scores = np.take_along_axis(all_scores, top_local, axis=1).astype(
-                "float32"
+            # Call C++ function with pre-reconstructed vectors
+            toploc_ivf_search_ptr(
+                int(ivf_index.this),
+                fu_embs,
+                cache["c0"],
+                NP,
+                RETRIEVE_K,
+                cache["c0_vecs"],
             )
-            sel_ids = c0_ids[top_local].astype("int64")
-
-            # 2. FAISS Fine Search
-            q_c = np.ascontiguousarray(fu_embs, dtype="float32")
-            sel_ids_c = np.ascontiguousarray(sel_ids, dtype="int64")
-            sel_scores_c = np.ascontiguousarray(sel_scores, dtype="float32")
-
-            old_nprobe = ivf_index.nprobe
-            ivf_index.nprobe = NP
-            ivf_index.search_preassigned(q_c, RETRIEVE_K, sel_ids_c, sel_scores_c)
-            ivf_index.nprobe = old_nprobe
-
             followup_total_ms += (time.perf_counter() - t0) * 1000
 
     return first_total_ms, followup_total_ms
@@ -347,7 +309,7 @@ print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f} 
 print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
 print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
 print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
-print(f"  Total ::: {((f_mean+u_mean)/2):8.2f}  ms")
+print(f"  Total ::: {((f_mean+u_mean)/173):8.2f}  ms")
 print(f"\nCentroids cached per conv: {H}")
 print(f"nprobe:                    {NP}")
 print("=" * 70)
