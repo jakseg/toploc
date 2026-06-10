@@ -218,14 +218,18 @@ for conv_id, turns in conversations.items():
         local_labels >= 0, global_centroid_ids[local_labels], -1
     ).astype("int64")
 
-    # 3. Run the restricted FAISS search (FIXED: using keyword arguments)
-    params = faiss.IVFSearchParameters()
-    params.nprobe = NP
-    params.max_codes = 0
+    # 3. Run the restricted FAISS search (VERSION-AGNOSTIC, NO KWARGS)
+    q_c = np.ascontiguousarray(fu_embs, dtype="float32")
+    labels_c = np.ascontiguousarray(global_coarse_labels, dtype="int64")
+    dists_c = np.ascontiguousarray(coarse_dists, dtype="float32")
 
-    scores_fu, indices_fu = base_index.search_preassigned(
-        fu_embs, k, global_coarse_labels, coarse_dists, store_pairs=False, params=params
-    )
+    old_nprobe = ivf_index.nprobe
+    ivf_index.nprobe = NP
+
+    # Simplified signature: search_preassigned(x, k, labels, coarse_dis) -> D, I
+    scores_fu, indices_fu = ivf_index.search_preassigned(q_c, k, labels_c, dists_c)
+
+    ivf_index.nprobe = old_nprobe
 
     for row_idx, turn_key in enumerate(followup_keys):
         for idx, score in zip(indices_fu[row_idx], scores_fu[row_idx]):
@@ -261,24 +265,23 @@ def timed_sweep():
             global_centroid_ids = conv_cache_global_ids[conv_id]
 
             t0 = time.perf_counter()
-            # Native FAISS Python (FIXED: using keyword arguments)
+
+            # Native FAISS Python (VERSION-AGNOSTIC, NO KWARGS)
             coarse_dists, local_labels = flat_idx.search(fu_embs, NP)
             global_coarse_labels = np.where(
                 local_labels >= 0, global_centroid_ids[local_labels], -1
             ).astype("int64")
 
-            params = faiss.IVFSearchParameters()
-            params.nprobe = NP
-            params.max_codes = 0
+            q_c = np.ascontiguousarray(fu_embs, dtype="float32")
+            labels_c = np.ascontiguousarray(global_coarse_labels, dtype="int64")
+            dists_c = np.ascontiguousarray(coarse_dists, dtype="float32")
 
-            base_index.search_preassigned(
-                fu_embs,
-                k,
-                global_coarse_labels,
-                coarse_dists,
-                store_pairs=False,
-                params=params,
-            )
+            old_nprobe = ivf_index.nprobe
+            ivf_index.nprobe = NP
+
+            ivf_index.search_preassigned(q_c, k, labels_c, dists_c)
+
+            ivf_index.nprobe = old_nprobe
             followup_total_ms += (time.perf_counter() - t0) * 1000
 
     return first_total_ms, followup_total_ms
@@ -340,6 +343,9 @@ print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f} 
 print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
 print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
 print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
+
+print(f"  Total: {(f_mean+ u_mean)/173}  ms")
+
 print(f"\nCentroids cached per conv: {H}")
 print(f"nprobe:                    {NP}")
 print("=" * 70)
