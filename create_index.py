@@ -12,6 +12,12 @@ import pyarrow.parquet as pq
 
 random.seed(42)
 
+# Force FAISS to use all cores. Otherwise k-means training and add() run
+# single-threaded if the environment pins OMP_NUM_THREADS=1 (common in conda
+# base envs), making the 2^18-centroid build ~Ncores times slower.
+faiss.omp_set_num_threads(int(os.environ.get("FAISS_THREADS", os.cpu_count() or 1)))
+print(f"FAISS threads: {faiss.omp_get_max_threads()} (of {os.cpu_count()} cores)")
+
 # ================= CONFIGURATION =================
 EMBEDDINGS_BASE = "/home/toploc2/Datasets/conversational/CAST2019"
 CACHE_BASE = "/home/toploc2/Datasets/toploc2"
