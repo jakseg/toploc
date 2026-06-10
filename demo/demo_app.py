@@ -23,6 +23,26 @@ import streamlit.components.v1 as components
 DEMO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 K = 10
 
+# Paper Table 1 — TREC CAsT 2019, full ~38M collection. Reported effectiveness
+# and latency (the demo subset cannot show these). Data-driven so a
+# "This reimplementation" column can be appended later.
+PAPER_TABLE = {
+    "snowflake": [
+        {"Method": "Exact",       "MRR@10": 0.817, "NDCG@3": 0.550, "NDCG@10": 0.502, "Time (ms)": "–",  "Speedup": "–"},
+        {"Method": "IVF",         "MRR@10": 0.815, "NDCG@3": 0.544, "NDCG@10": 0.497, "Time (ms)": "24.9", "Speedup": "–"},
+        {"Method": "TopLoc IVF",  "MRR@10": 0.827, "NDCG@3": 0.555, "NDCG@10": 0.505, "Time (ms)": "5.7",  "Speedup": "4.4×"},
+        {"Method": "HNSW",        "MRR@10": 0.814, "NDCG@3": 0.548, "NDCG@10": 0.500, "Time (ms)": "1.8",  "Speedup": "–"},
+        {"Method": "TopLoc HNSW", "MRR@10": 0.808, "NDCG@3": 0.549, "NDCG@10": 0.493, "Time (ms)": "0.7",  "Speedup": "2.6×"},
+    ],
+    "dragon": [
+        {"Method": "Exact",       "MRR@10": 0.799, "NDCG@3": 0.522, "NDCG@10": 0.492, "Time (ms)": "–",  "Speedup": "–"},
+        {"Method": "IVF",         "MRR@10": 0.813, "NDCG@3": 0.528, "NDCG@10": 0.486, "Time (ms)": "33.0", "Speedup": "–"},
+        {"Method": "TopLoc IVF",  "MRR@10": 0.789, "NDCG@3": 0.517, "NDCG@10": 0.479, "Time (ms)": "6.5",  "Speedup": "5.1×"},
+        {"Method": "HNSW",        "MRR@10": 0.789, "NDCG@3": 0.508, "NDCG@10": 0.469, "Time (ms)": "8.3",  "Speedup": "–"},
+        {"Method": "TopLoc HNSW", "MRR@10": 0.785, "NDCG@3": 0.503, "NDCG@10": 0.466, "Time (ms)": "0.8",  "Speedup": "10.4×"},
+    ],
+}
+
 # Real TopLoc kernel: the compiled C++ module (toploc_search.cpp) shared with
 # toploc_ivf.py. Built into the repo root. If it is not compiled in this env,
 # fall back to an equivalent pure-Python path so the demo still runs.
@@ -52,6 +72,11 @@ def load_demo():
         ivf.make_direct_map()
     except Exception:
         pass
+
+    # HNSW is optional — only present if build_demo_subset.py was rerun with it.
+    hnsw_path = os.path.join(DEMO_DIR, "hnsw_index.index")
+    hnsw = faiss.read_index(hnsw_path) if os.path.exists(hnsw_path) else None
+
     ids = np.load(os.path.join(DEMO_DIR, "ids.npy"), allow_pickle=True)
     id_map = {i: str(pid) for i, pid in enumerate(ids)}
 
@@ -68,7 +93,7 @@ def load_demo():
         t = pq.read_table(tep)
         topic_emb = {str(i): np.asarray(e, dtype="float32") for i, e in
                      zip(t.column("id").to_pylist(), t.column("embedding").to_pylist())}
-    return meta, exact, ivf, id_map, texts, topics, qrels, topic_emb
+    return meta, exact, ivf, hnsw, id_map, texts, topics, qrels, topic_emb
 
 
 @st.cache_resource
@@ -91,6 +116,24 @@ def list_sizes(ivf):
 def search_exact(exact, q, k):
     scores, idx = exact.search(q, k)
     return scores[0], idx[0], exact.ntotal  # scanned = all vectors
+
+
+def search_hnsw(hnsw, q, k, ef_search):
+    """Plain FAISS HNSW search (the baseline), like evaluate_baseline.py.
+
+    ``scanned`` is the real number of distance computations the graph traversal
+    performed (faiss hnsw_stats.ndis) — the scale-independent efficiency proxy,
+    directly comparable to the IVF/Exact "vectors compared" counts.
+    """
+    hnsw.hnsw.efSearch = int(ef_search)
+    try:
+        faiss.cvar.hnsw_stats.reset()
+        scores, idx = hnsw.search(q, k)
+        scanned = int(faiss.cvar.hnsw_stats.ndis)
+    except Exception:
+        scores, idx = hnsw.search(q, k)
+        scanned = int(ef_search)  # fallback if stats are unavailable
+    return scores[0], idx[0], scanned
 
 
 def search_ivf(ivf, q, k, nprobe, sizes):
@@ -168,7 +211,7 @@ def metrics_for(qid, ranked_pids, scores, qrels):
 
 
 # ================= APP =================
-meta, exact, ivf, id_map, texts, topics, qrels, topic_emb = load_demo()
+meta, exact, ivf, hnsw, id_map, texts, topics, qrels, topic_emb = load_demo()
 sizes = list_sizes(ivf)
 
 st.title("TopLoc — Conversational Dense Retrieval")
@@ -177,10 +220,14 @@ st.caption(f"Demo subset: {meta['n_passages']:,} passages · model={meta['model'
 
 with st.sidebar:
     st.header("Settings")
-    method = st.radio("Search method", ["Exact", "IVF", "TopLoc IVF"], index=2)
+    methods = ["Exact", "IVF", "TopLoc IVF"] + (["HNSW"] if hnsw is not None else [])
+    method = st.radio("Search method", methods, index=2)
     nprobe = st.slider("nprobe", 1, meta["nlist"], min(8, meta["nlist"]))
     h = st.slider("TopLoc cached centroids (h)", 1, meta["nlist"],
                   min(16, meta["nlist"]))
+    if hnsw is not None:
+        ef_search = st.slider("efSearch (HNSW)", K, 256,
+                              int(meta.get("hnsw_ef_search", 64)))
 
 st.session_state.setdefault("history", [])
 st.session_state.setdefault("toploc_cache", None)
@@ -265,6 +312,8 @@ if query_vec is not None:
                                                  st.session_state.toploc_cache, sizes)
     elif method == "IVF":
         scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
+    elif method == "HNSW":
+        scores, idx, scanned = search_hnsw(hnsw, query_vec, K, ef_search)
     else:
         scores, idx, scanned = search_exact(exact, query_vec, K)
 
@@ -272,10 +321,19 @@ if query_vec is not None:
     ranked_scores = [float(s) for s, i in zip(scores, idx) if i >= 0]
     m = metrics_for(query_id, ranked_pids, ranked_scores, qrels) if query_id else None
 
+    # Agreement with exhaustive search: how many of this method's top-k also
+    # appear in Exact's top-k. Honest accuracy proxy on the subset (relative to
+    # exact, not to relevance) and defined for free-text queries too.
+    _, ex_idx = exact.search(query_vec, K)
+    exact_set = {int(i) for i in ex_idx[0] if i >= 0}
+    method_set = {int(i) for i in idx if i >= 0}
+    agreement = len(method_set & exact_set)
+
     st.session_state.history.append({
         "turn": len(st.session_state.history) + 1, "query": query_text, "method": method,
         "scanned": scanned, "speedup": exact.ntotal / max(scanned, 1),
         "pids": ranked_pids, "scores": ranked_scores, "metrics": m,
+        "agreement": agreement, "k": K,
     })
     st.session_state._scroll_top = True  # keep focus on the chart, don't jump down
 
@@ -334,16 +392,21 @@ if st.session_state.history:
 
 # ---- Render conversation: per-turn metrics + collapsed answers ----
 for turn in st.session_state.history:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Vectors compared", f"{turn['scanned']:,}",
               help=f"Exact would compare all {exact.ntotal:,}")
     c2.metric("Speedup vs Exact", f"{turn['speedup']:.1f}×")
+    k_turn = turn.get("k", K)
+    c3.metric("Agreement w/ Exact", f"{turn.get('agreement', k_turn)}/{k_turn}",
+              help="Top-k overlap with exhaustive Exact search — shows the "
+                   "approximation returns the same results despite scanning less.")
     if turn["metrics"]:
-        c3.metric("NDCG@10", f"{turn['metrics']['NDCG@10']:.3f}",
+        c4.metric("NDCG@10", f"{turn['metrics']['NDCG@10']:.3f}",
                   help=f"NDCG@3={turn['metrics']['NDCG@3']:.3f} · "
-                       f"MRR@10={turn['metrics']['MRR@10']:.3f}")
+                       f"MRR@10={turn['metrics']['MRR@10']:.3f} · "
+                       f"On the 2k-doc subset — indicative only; real values: paper reference below.")
     else:
-        c3.metric("NDCG@10", "—", help="Only available for known CAsT turns")
+        c4.metric("NDCG@10", "—", help="Only available for known CAsT turns")
     with st.expander(
         f"Turn {turn['turn']} · {turn['method']} — {turn['query']}",
         expanded=False,
@@ -352,6 +415,18 @@ for turn in st.session_state.history:
             st.markdown(f"**{rank}.** `{pid}` · score={sc:.3f}")
             st.caption(texts.get(pid, "(text not in subset)")[:400])
     st.write("")  # small spacer between turns
+
+# ---- Paper reference numbers (full 38M collection) ----
+if meta["model"] in PAPER_TABLE:
+    with st.expander("Paper reference — full collection (TopLoc, CAsT 2019)"):
+        ref_df = pd.DataFrame(PAPER_TABLE[meta["model"]]).set_index("Method")
+        st.table(ref_df)
+        st.caption(
+            f"Reported by the TopLoc paper for **{meta['model']}** on the full "
+            "~38M-passage TREC CAsT 2019 collection — the real effectiveness and "
+            "latency the 2k-doc demo above cannot show. A 'This reimplementation' "
+            "column can be added once our numbers are final."
+        )
 
 st.divider()
 st.caption("Speed shown as **vectors compared** — a scale-independent proxy. "
