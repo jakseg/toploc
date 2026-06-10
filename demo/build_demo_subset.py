@@ -15,6 +15,7 @@ Outputs (in OUT_DIR):
   passages.parquet     id, text, embedding   (the subset)
   exact_index.index    IndexFlatIP over the subset
   ivf_index.index      IndexIVFFlat over the subset
+  hnsw_index.index     IndexHNSWFlat over the subset
   ids.npy              passage ids in index order (row -> pid)
   topic_embeddings.parquet  id, embedding     (precomputed query vectors)
   topics.json          turn_key -> query text
@@ -49,6 +50,11 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 TARGET_N = 2000
 SEED = 42
+
+# HNSW build params — mirror create_index.py so the demo matches the full setup.
+HNSW_M = 32
+HNSW_EF_CONSTRUCTION = 200
+HNSW_EF_SEARCH = 64
 
 random.seed(SEED)
 
@@ -242,8 +248,16 @@ def build_indexes(embs, dim):
     ivf.train(embs)
     ivf.add(embs)
     ivf.make_direct_map()
-    print(f"Indexes built: exact (ntotal={exact.ntotal}), ivf (nlist={nlist})")
-    return exact, ivf, nlist
+
+    # HNSW — same parameters as create_index.py (M, efConstruction, efSearch).
+    hnsw = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
+    hnsw.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+    hnsw.add(embs)
+    hnsw.hnsw.efSearch = HNSW_EF_SEARCH
+
+    print(f"Indexes built: exact (ntotal={exact.ntotal}), ivf (nlist={nlist}), "
+          f"hnsw (M={HNSW_M}, efC={HNSW_EF_CONSTRUCTION}, efS={HNSW_EF_SEARCH})")
+    return exact, ivf, hnsw, nlist
 
 
 # ================= MAIN =================
@@ -260,9 +274,10 @@ def main():
     embs = np.asarray([e for _, e in subset], dtype="float32")
 
     # Build & save indexes (embs is normalized in place).
-    exact, ivf, nlist = build_indexes(embs, dim)
+    exact, ivf, hnsw, nlist = build_indexes(embs, dim)
     faiss.write_index(exact, os.path.join(OUT_DIR, "exact_index.index"))
     faiss.write_index(ivf, os.path.join(OUT_DIR, "ivf_index.index"))
+    faiss.write_index(hnsw, os.path.join(OUT_DIR, "hnsw_index.index"))
     np.save(os.path.join(OUT_DIR, "ids.npy"), np.array(subset_ids, dtype=object))
 
     # Save passages (id, text, normalized embedding) in index order.
@@ -308,6 +323,8 @@ def main():
         json.dump(topics, f, ensure_ascii=False)
     with open(os.path.join(OUT_DIR, "meta.json"), "w", encoding="utf-8") as f:
         json.dump({"model": MODEL, "dim": dim, "nlist": nlist,
+                   "hnsw_M": HNSW_M, "hnsw_ef_construction": HNSW_EF_CONSTRUCTION,
+                   "hnsw_ef_search": HNSW_EF_SEARCH,
                    "n_passages": len(subset_ids), "n_judged": len(judged),
                    "target_n": TARGET_N}, f)
 
