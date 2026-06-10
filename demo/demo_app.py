@@ -31,6 +31,7 @@ PAPER_TABLE = {
         {"Method": "Exact",       "MRR@10": 0.817, "NDCG@3": 0.550, "NDCG@10": 0.502, "Time (ms)": "–",  "Speedup": "–"},
         {"Method": "IVF",         "MRR@10": 0.815, "NDCG@3": 0.544, "NDCG@10": 0.497, "Time (ms)": "24.9", "Speedup": "–"},
         {"Method": "TopLoc IVF",  "MRR@10": 0.827, "NDCG@3": 0.555, "NDCG@10": 0.505, "Time (ms)": "5.7",  "Speedup": "4.4×"},
+        {"Method": "TopLoc IVF+", "MRR@10": 0.827, "NDCG@3": 0.554, "NDCG@10": 0.501, "Time (ms)": "5.7",  "Speedup": "4.4×"},
         {"Method": "HNSW",        "MRR@10": 0.814, "NDCG@3": 0.548, "NDCG@10": 0.500, "Time (ms)": "1.8",  "Speedup": "–"},
         {"Method": "TopLoc HNSW", "MRR@10": 0.808, "NDCG@3": 0.549, "NDCG@10": 0.493, "Time (ms)": "0.7",  "Speedup": "2.6×"},
     ],
@@ -38,6 +39,7 @@ PAPER_TABLE = {
         {"Method": "Exact",       "MRR@10": 0.799, "NDCG@3": 0.522, "NDCG@10": 0.492, "Time (ms)": "–",  "Speedup": "–"},
         {"Method": "IVF",         "MRR@10": 0.813, "NDCG@3": 0.528, "NDCG@10": 0.486, "Time (ms)": "33.0", "Speedup": "–"},
         {"Method": "TopLoc IVF",  "MRR@10": 0.789, "NDCG@3": 0.517, "NDCG@10": 0.479, "Time (ms)": "6.5",  "Speedup": "5.1×"},
+        {"Method": "TopLoc IVF+", "MRR@10": 0.795, "NDCG@3": 0.518, "NDCG@10": 0.477, "Time (ms)": "3.8",  "Speedup": "8.7×"},
         {"Method": "HNSW",        "MRR@10": 0.789, "NDCG@3": 0.508, "NDCG@10": 0.469, "Time (ms)": "8.3",  "Speedup": "–"},
         {"Method": "TopLoc HNSW", "MRR@10": 0.785, "NDCG@3": 0.503, "NDCG@10": 0.466, "Time (ms)": "0.8",  "Speedup": "10.4×"},
     ],
@@ -197,6 +199,120 @@ def build_toploc_cache(ivf, q0, h):
     return cent[0].astype("int64")
 
 
+# ----- TopLoc IVF+ : cache + drift detection (mirrors toploc_ivf_plus.py) -----
+def rank_within_cache(c0_vecs, q, nprobe):
+    """Top-nprobe centroids within the cache (IP on normalized vectors).
+
+    Returns local indices into C0 — like rank_within_cache in toploc_ivf_plus.py.
+    """
+    coarse = c0_vecs @ q[0]
+    npr = min(nprobe, len(c0_vecs))
+    order = np.argpartition(-coarse, npr - 1)[:npr]
+    return order[np.argsort(-coarse[order])]
+
+
+def build_toploc_cache_plus(ivf, q0, h, nprobe):
+    """IVF+ cache: cached centroid ids, their vectors, and the first-turn top set."""
+    c0 = build_toploc_cache(ivf, q0, h)
+    c0_vecs = centroid_vectors(ivf.quantizer, c0)
+    top0 = rank_within_cache(c0_vecs, q0, nprobe)
+    return {"c0": c0, "c0_vecs": c0_vecs, "top0": top0}
+
+
+def search_toploc_plus(ivf, q, k, nprobe, cache, sizes, alpha):
+    """TopLoc IVF+: refresh the cache on topic drift, then restricted search.
+
+    Drift = the top-nprobe overlap with the first turn (I0) drops below
+    alpha*nprobe. On refresh, the full coarse search over all centroids is added
+    to ``scanned`` (a refresh costs a first-turn-style coarse pass).
+    Returns (scores, idx, scanned, cache, refreshed).
+    """
+    top_j = rank_within_cache(cache["c0_vecs"], q, nprobe)
+    i0 = len(np.intersect1d(top_j, cache["top0"]))
+    refreshed = i0 < alpha * nprobe
+    refresh_cost = 0
+    if refreshed:
+        cache = build_toploc_cache_plus(ivf, q, len(cache["c0"]), nprobe)
+        refresh_cost = ivf.nlist  # refresh = full coarse over all centroids
+    scores, idx, scanned = search_toploc(ivf, q, k, nprobe, cache["c0"], sizes)
+    return scores, idx, scanned + refresh_cost, cache, refreshed
+
+
+# ----- TopLoc HNSW : privileged entry point + level-0 beam search ----------
+# Mirrors toploc_hnsw_2.py. The follow-up search runs in Python; ``scanned`` is
+# the number of visited graph nodes — exactly the efficiency proxy the demo
+# shows (identical to what a C++ kernel would report; C++ only changes latency).
+@st.cache_resource
+def hnsw_level0_graph(_hnsw):
+    h = _hnsw.hnsw
+    offsets = faiss.vector_to_array(h.offsets).astype("int64")
+    neighbors = faiss.vector_to_array(h.neighbors).astype("int64")
+    return offsets, neighbors, int(h.nb_neighbors(0))
+
+
+def _hnsw_reconstruct(hnsw, ids):
+    ids = np.asarray(ids, dtype="int64")
+    try:
+        return hnsw.reconstruct_batch(ids).astype("float32")
+    except Exception:
+        out = np.empty((len(ids), hnsw.d), dtype="float32")
+        for i, n in enumerate(ids):
+            hnsw.reconstruct(int(n), out[i])
+        return out
+
+
+def build_hnsw_entry(hnsw, q0, up, ef_search, entry_points=1):
+    """Turn 0: full HNSW search with efSearch*up; cache the top entry point(s)."""
+    old = hnsw.hnsw.efSearch
+    hnsw.hnsw.efSearch = int(ef_search * up)
+    try:
+        faiss.cvar.hnsw_stats.reset()
+        scores, idx = hnsw.search(q0, max(K, entry_points))
+        scanned = int(faiss.cvar.hnsw_stats.ndis)
+    except Exception:
+        scores, idx = hnsw.search(q0, max(K, entry_points))
+        scanned = int(ef_search * up)
+    hnsw.hnsw.efSearch = old
+    entry = [int(x) for x in idx[0][:entry_points] if int(x) >= 0]
+    return entry, scores[0], idx[0], scanned
+
+
+def search_toploc_hnsw(hnsw, graph, q, k, entry_points, ef_search):
+    """Follow-up: level-0 beam search starting from the cached entry point(s)."""
+    import heapq
+    offsets, neighbors, degree0 = graph
+    qv = q.reshape(-1).astype("float32")
+    candidates, results, visited = [], [], set()
+
+    def add(nodes):
+        new = [int(n) for n in nodes if int(n) >= 0 and int(n) not in visited]
+        for n in new:
+            visited.add(n)
+        if not new:
+            return
+        for n, sc in zip(new, _hnsw_reconstruct(hnsw, new) @ qv):
+            sc = float(sc)
+            heapq.heappush(candidates, (-sc, n))
+            if len(results) < ef_search:
+                heapq.heappush(results, (sc, n))
+            elif sc > results[0][0]:
+                heapq.heapreplace(results, (sc, n))
+
+    add(entry_points)
+    while candidates:
+        neg, cur = heapq.heappop(candidates)
+        if len(results) >= ef_search and -neg < results[0][0]:
+            break
+        start = int(offsets[cur])
+        block = neighbors[start:start + degree0]
+        add(block[block >= 0])
+
+    top = sorted(results, key=lambda x: x[0], reverse=True)[:k]
+    scores = np.array([s for s, _ in top], dtype="float32")
+    idx = np.array([n for _, n in top], dtype="int64")
+    return scores, idx, len(visited)
+
+
 # ================= METRICS =================
 def metrics_for(qid, ranked_pids, scores, qrels):
     """NDCG@3, NDCG@10, MRR@10 for a single known turn, else None."""
@@ -220,14 +336,21 @@ st.caption(f"Demo subset: {meta['n_passages']:,} passages · model={meta['model'
 
 with st.sidebar:
     st.header("Settings")
-    methods = ["Exact", "IVF", "TopLoc IVF"] + (["HNSW"] if hnsw is not None else [])
+    methods = (["Exact", "IVF", "TopLoc IVF", "TopLoc IVF+"]
+               + (["HNSW", "TopLoc HNSW"] if hnsw is not None else []))
     method = st.radio("Search method", methods, index=2)
     nprobe = st.slider("nprobe", 1, meta["nlist"], min(8, meta["nlist"]))
     h = st.slider("TopLoc cached centroids (h)", 1, meta["nlist"],
                   min(16, meta["nlist"]))
+    alpha = st.slider("IVF+ refresh α (drift)", 0.0, 0.5, 0.1, 0.05,
+                      help="IVF+ refreshes the cache when the top-nprobe overlap "
+                           "with the first turn drops below α·nprobe (topic drift).")
     if hnsw is not None:
         ef_search = st.slider("efSearch (HNSW)", K, 256,
                               int(meta.get("hnsw_ef_search", 64)))
+        up = st.slider("TopLoc HNSW upscaling (up)", 1, 8, 2,
+                       help="First turn searches with efSearch×up to pick a "
+                            "strong privileged entry point for the follow-ups.")
 
 st.session_state.setdefault("history", [])
 st.session_state.setdefault("toploc_cache", None)
@@ -300,16 +423,37 @@ else:
 # ---- Run a query ----
 if query_vec is not None:
     is_first = len(st.session_state.history) == 0
+    refreshed = False
+    cache = st.session_state.toploc_cache
     if method == "TopLoc IVF":
-        if is_first or st.session_state.toploc_cache is None:
+        if is_first or not isinstance(cache, np.ndarray):
             # First turn: a standard IVF search seeds the conversation cache
             # (coarse over all centroids) — exactly like toploc_ivf.py turn 0.
             st.session_state.toploc_cache = build_toploc_cache(ivf, query_vec, h)
             scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
         else:
             # Follow-up turns: restricted search over the cached centroids (C++).
-            scores, idx, scanned = search_toploc(ivf, query_vec, K, nprobe,
-                                                 st.session_state.toploc_cache, sizes)
+            scores, idx, scanned = search_toploc(ivf, query_vec, K, nprobe, cache, sizes)
+    elif method == "TopLoc IVF+":
+        if is_first or not (isinstance(cache, dict) and "c0" in cache):
+            # First turn: build the richer IVF+ cache + full search.
+            st.session_state.toploc_cache = build_toploc_cache_plus(
+                ivf, query_vec, h, nprobe)
+            scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
+        else:
+            # Follow-up: drift check, refresh on topic shift, then restricted search.
+            scores, idx, scanned, st.session_state.toploc_cache, refreshed = \
+                search_toploc_plus(ivf, query_vec, K, nprobe, cache, sizes, alpha)
+    elif method == "TopLoc HNSW":
+        if is_first or not (isinstance(cache, dict) and "entry" in cache):
+            # First turn: full HNSW (efSearch×up) seeds the privileged entry point.
+            entry, scores, idx, scanned = build_hnsw_entry(hnsw, query_vec, up, ef_search)
+            scores, idx = scores[:K], idx[:K]
+            st.session_state.toploc_cache = {"entry": entry}
+        else:
+            # Follow-up: level-0 beam search from the cached entry point.
+            scores, idx, scanned = search_toploc_hnsw(
+                hnsw, hnsw_level0_graph(hnsw), query_vec, K, cache["entry"], ef_search)
     elif method == "IVF":
         scores, idx, scanned = search_ivf(ivf, query_vec, K, nprobe, sizes)
     elif method == "HNSW":
@@ -333,7 +477,7 @@ if query_vec is not None:
         "turn": len(st.session_state.history) + 1, "query": query_text, "method": method,
         "scanned": scanned, "speedup": exact.ntotal / max(scanned, 1),
         "pids": ranked_pids, "scores": ranked_scores, "metrics": m,
-        "agreement": agreement, "k": K,
+        "agreement": agreement, "k": K, "refreshed": refreshed,
     })
     st.session_state._scroll_top = True  # keep focus on the chart, don't jump down
 
@@ -407,10 +551,10 @@ for turn in st.session_state.history:
                        f"On the 2k-doc subset — indicative only; real values: paper reference below.")
     else:
         c4.metric("NDCG@10", "—", help="Only available for known CAsT turns")
-    with st.expander(
-        f"Turn {turn['turn']} · {turn['method']} — {turn['query']}",
-        expanded=False,
-    ):
+    label = f"Turn {turn['turn']} · {turn['method']} — {turn['query']}"
+    if turn.get("refreshed"):
+        label += "   · cache refreshed (drift)"
+    with st.expander(label, expanded=False):
         for rank, (pid, sc) in enumerate(zip(turn["pids"], turn["scores"]), 1):
             st.markdown(f"**{rank}.** `{pid}` · score={sc:.3f}")
             st.caption(texts.get(pid, "(text not in subset)")[:400])
