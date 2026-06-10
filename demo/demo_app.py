@@ -13,9 +13,12 @@ import sys
 import json
 
 import numpy as np
+import pandas as pd
+import altair as alt
 import faiss
 import pyarrow.parquet as pq
 import streamlit as st
+import streamlit.components.v1 as components
 
 DEMO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 K = 10
@@ -168,7 +171,7 @@ def metrics_for(qid, ranked_pids, scores, qrels):
 meta, exact, ivf, id_map, texts, topics, qrels, topic_emb = load_demo()
 sizes = list_sizes(ivf)
 
-st.title("🔎 TopLoc — Conversational Dense Retrieval")
+st.title("TopLoc — Conversational Dense Retrieval")
 st.caption(f"Demo subset: {meta['n_passages']:,} passages · model={meta['model']} · "
            f"IVF nlist={meta['nlist']} · dim={meta['dim']}")
 
@@ -178,27 +181,74 @@ with st.sidebar:
     nprobe = st.slider("nprobe", 1, meta["nlist"], min(8, meta["nlist"]))
     h = st.slider("TopLoc cached centroids (h)", 1, meta["nlist"],
                   min(16, meta["nlist"]))
-    st.divider()
-    if st.button("🆕 New conversation"):
-        st.session_state.history = []
-        st.session_state.toploc_cache = None
-    st.markdown("**Known CAsT turn** (uses precomputed embedding + metrics):")
-    known = st.selectbox("Pick a turn", [""] + sorted(topic_emb.keys()),
-                         format_func=lambda x: f"{x}: {topics.get(x, '')[:50]}" if x else "—")
 
 st.session_state.setdefault("history", [])
 st.session_state.setdefault("toploc_cache", None)
 
-# ---- Query input: known turn (button) or free text (chat) ----
+# ---- Query input: toggle between known turn and free text ----
 query_text, query_id, query_vec = None, None, None
-if known:
-    if st.sidebar.button("Run selected turn"):
+
+_modes = ["Known CAsT turn", "Free text"]
+col_mode, col_new = st.columns([3, 1])
+with col_mode:
+    if hasattr(st, "segmented_control"):
+        mode = st.segmented_control("Input", _modes, default=_modes[0],
+                                    label_visibility="collapsed")
+    else:
+        mode = st.radio("Input", _modes, horizontal=True,
+                        label_visibility="collapsed")
+with col_new:
+    if st.button("New conversation", use_container_width=True):
+        st.session_state.history = []
+        st.session_state.toploc_cache = None
+
+# Per-mode state: when switching, stash the current conversation and restore the
+# target mode's, so reopening a mode shows exactly what was there before.
+if mode is not None and st.session_state.get("_mode") != mode:
+    store = st.session_state.setdefault("mode_store", {})
+    prev = st.session_state.get("_mode")
+    if prev is not None:
+        store[prev] = {"history": st.session_state.get("history", []),
+                       "toploc_cache": st.session_state.get("toploc_cache")}
+    restored = store.get(mode, {"history": [], "toploc_cache": None})
+    st.session_state.history = restored["history"]
+    st.session_state.toploc_cache = restored["toploc_cache"]
+    st.session_state._mode = mode
+
+if mode == _modes[1]:
+    # Free text → encode the query live.
+    with st.form("free_query", clear_on_submit=True):
+        c_in, c_send = st.columns([6, 1])
+        typed = c_in.text_input(
+            "Ask a question", label_visibility="collapsed",
+            placeholder="Ask a question (follow-ups reuse the TopLoc cache)…",
+        )
+        submitted = c_send.form_submit_button("Send", use_container_width=True)
+    if submitted and typed:
+        try:
+            with st.spinner("Encoding query…"):
+                query_vec = load_encoder(meta["model"])(typed)
+            query_text = typed
+        except Exception:
+            query_vec = None
+            st.error(
+                "Free-text queries need the query encoder, which isn't installed in "
+                "this environment. Run `pip install sentence-transformers` in the "
+                "`toploc-demo` env (the model downloads on first use), or use the "
+                "'Known CAsT turn' mode — those use precomputed embeddings."
+            )
+else:
+    # Known CAsT turn → precomputed embedding + real metrics (default mode).
+    c_sel, c_btn = st.columns([5, 1])
+    known = c_sel.selectbox(
+        "Pick a turn", [""] + sorted(topic_emb.keys()),
+        format_func=lambda x: f"{x}: {topics.get(x, '')[:60]}" if x else "—",
+        label_visibility="collapsed",
+    )
+    if c_btn.button("Run", use_container_width=True, disabled=not known):
         query_text, query_id = topics.get(known, known), known
         query_vec = topic_emb[known].reshape(1, -1).copy()
-typed = st.chat_input("Ask a question (follow-ups reuse the TopLoc cache)…")
-if typed:
-    query_text = typed
-    query_vec = load_encoder(meta["model"])(typed)
+    st.caption("Uses precomputed embeddings → real NDCG / MRR metrics.")
 
 # ---- Run a query ----
 if query_vec is not None:
@@ -227,26 +277,104 @@ if query_vec is not None:
         "scanned": scanned, "speedup": exact.ntotal / max(scanned, 1),
         "pids": ranked_pids, "scores": ranked_scores, "metrics": m,
     })
+    st.session_state._scroll_top = True  # keep focus on the chart, don't jump down
 
-# ---- Render conversation ----
+# ---- Efficiency chart: vectors compared per turn (compact, on top) ----
+if st.session_state.history:
+    df = pd.DataFrame([
+        {
+            "Turn": t["turn"],
+            "Vectors compared": t["scanned"],
+            "Method": t["method"],
+            "Role": "First turn" if t["turn"] == 1 else "Follow-up",
+        }
+        for t in st.session_state.history
+    ])
+
+    bars = (
+        alt.Chart(df)
+        .mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5, opacity=0.92)
+        .encode(
+            x=alt.X("Turn:O", title=None,
+                    axis=alt.Axis(labelAngle=0, labelFontSize=18)),
+            y=alt.Y("Vectors compared:Q", title="Vectors compared",
+                    axis=alt.Axis(format="~s", gridOpacity=0.25, labelFontSize=15)),
+            color=alt.Color(
+                "Role:N", title=None,
+                scale=alt.Scale(domain=["First turn", "Follow-up"],
+                                range=["#cbd5e1", "#10b981"]),
+                legend=alt.Legend(orient="top", labelFontSize=17, symbolType="circle",
+                                  symbolSize=200),
+            ),
+            tooltip=["Turn:O", "Method:N", alt.Tooltip("Vectors compared:Q", format=",")],
+        )
+    )
+    labels = bars.mark_text(dy=-10, baseline="bottom", fontSize=22,
+                            fontWeight="bold").encode(
+        text=alt.Text("Vectors compared:Q", format="~s"), color=alt.value("#334155"))
+    chart = (
+        (bars + labels)
+        .properties(height=230)
+        .configure_view(stroke=None)
+        .configure_axis(labelColor="#64748b", titleColor="#64748b", titleFontSize=17,
+                        domainColor="#e2e8f0", tickColor="#e2e8f0")
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    follow_ups = df[df["Role"] == "Follow-up"]
+    if not follow_ups.empty:
+        first_n = int(df.loc[df["Role"] == "First turn", "Vectors compared"].iloc[0])
+        avg_fu = follow_ups["Vectors compared"].mean()
+        st.caption(
+            f"First turn compares **{first_n:,}** vectors; follow-ups reuse the "
+            f"cache and compare on average **{avg_fu:,.0f}** "
+            f"(**{first_n / max(avg_fu, 1):.1f}× fewer**) · Exact always **{exact.ntotal:,}**."
+        )
+    st.divider()
+
+# ---- Render conversation: per-turn metrics + collapsed answers ----
 for turn in st.session_state.history:
-    with st.chat_message("user"):
-        st.write(f"**Turn {turn['turn']}** · *{turn['method']}* — {turn['query']}")
-    with st.chat_message("assistant"):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Vectors compared", f"{turn['scanned']:,}",
-                  help=f"Exact would compare all {exact.ntotal:,}")
-        c2.metric("Speedup vs Exact", f"{turn['speedup']:.1f}×")
-        if turn["metrics"]:
-            c3.metric("NDCG@10", f"{turn['metrics']['NDCG@10']:.3f}",
-                      help=f"NDCG@3={turn['metrics']['NDCG@3']:.3f} · "
-                           f"MRR@10={turn['metrics']['MRR@10']:.3f}")
-        else:
-            c3.metric("NDCG@10", "—", help="Only available for known CAsT turns")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Vectors compared", f"{turn['scanned']:,}",
+              help=f"Exact would compare all {exact.ntotal:,}")
+    c2.metric("Speedup vs Exact", f"{turn['speedup']:.1f}×")
+    if turn["metrics"]:
+        c3.metric("NDCG@10", f"{turn['metrics']['NDCG@10']:.3f}",
+                  help=f"NDCG@3={turn['metrics']['NDCG@3']:.3f} · "
+                       f"MRR@10={turn['metrics']['MRR@10']:.3f}")
+    else:
+        c3.metric("NDCG@10", "—", help="Only available for known CAsT turns")
+    with st.expander(
+        f"Turn {turn['turn']} · {turn['method']} — {turn['query']}",
+        expanded=False,
+    ):
         for rank, (pid, sc) in enumerate(zip(turn["pids"], turn["scores"]), 1):
             st.markdown(f"**{rank}.** `{pid}` · score={sc:.3f}")
             st.caption(texts.get(pid, "(text not in subset)")[:400])
+    st.write("")  # small spacer between turns
 
 st.divider()
 st.caption("Speed shown as **vectors compared** — a scale-independent proxy. "
            "Real wall-clock latency at full 38M scale: see the demo video.")
+st.caption(
+    "Based on **TopLoc** — Cristina Ioana Muntean, Franco Maria Nardini, "
+    "Raffaele Perego, Guido Rocchietti & Cosimo Rulli, *Efficient Conversational "
+    "Search via Topical Locality in Dense Retrieval*, SIGIR ’25, Padua, Italy."
+)
+
+# After a new query, scroll the page back to the top so the chart stays in view
+# instead of the viewport jumping down to the chat input.
+if st.session_state.pop("_scroll_top", False):
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        const el = doc.querySelector('section.main')
+                || doc.querySelector('[data-testid="stMain"]')
+                || doc.querySelector('[data-testid="stAppViewContainer"]');
+        if (el) { el.scrollTo({top: 0, behavior: 'smooth'}); }
+        window.parent.scrollTo({top: 0, behavior: 'smooth'});
+        </script>
+        """,
+        height=0,
+    )
