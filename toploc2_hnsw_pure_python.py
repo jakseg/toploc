@@ -363,7 +363,7 @@ def adaptive_ef_search(s, s_max, th, ef_default, ef_min):
 
 
 def route(q, iq, ep_table, index_d, graph, s_max,
-          k=10, k_prime=10, th=0.5, ef_default=512, ef_min=16):
+          k=10, k_prime=10, th=0.5, ef_default=100, ef_min=10):
     """Route one query (Alg. 1). Returns (scores, indices, visited, routed, s);
     visited is None on the fallback path (native FAISS gives no count).
 
