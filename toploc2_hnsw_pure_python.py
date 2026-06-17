@@ -312,6 +312,40 @@ def build_query_log_index(log_emb, m=32, ef_construction=500, ef_search=64):
     return iq
 
 
+# ================= QLR STEP 2 — LOOKUP TABLE (EP) + s_max =================
+def build_lookup_table(index_d, log_emb, k_ep=10, ep_build_ef_search=512, smax_percentile=75):
+    """Build EP (the lookup table) and the reference similarity s_max.
+
+    For each historical query in Q_L, search the document index I_D for its
+    k_ep nearest documents. Those document node ids are the precomputed entry 
+    points reused at query time as the seed set C — so at query time we skip 
+    the costly top-down HNSW traversal and jump straight into the right neighbourhood.
+
+    log_emb: (n_log, d) float32, L2-normalised historical query vectors.
+
+    Returns:
+        ep_table: (n_log, k_ep) int64 — document node ids per log query.
+        s_max:    float — the smax_percentile-th percentile of each log query's
+                  top-1 similarity to a document; calibrates the adaptive
+                  efSearch in the search phase.
+
+    k_ep is how many neighbours we store (paper: 10). ep_build_ef_search is the
+    one-time offline build-quality knob (beam width, must be >= k_ep); higher =
+    better stored neighbours. Not a paper value — the paper only sweeps the
+    query-time efSearch over [10, 200].
+    """
+    old_ef = index_d.hnsw.efSearch
+    index_d.hnsw.efSearch = max(ep_build_ef_search, k_ep)
+    ep_scores, ep_ids = index_d.search(
+        np.ascontiguousarray(log_emb, dtype="float32"), k_ep
+    )
+    index_d.hnsw.efSearch = old_ef
+
+    ep_table = ep_ids.astype("int64")                       # (n_log, k_ep) doc node ids
+    s_max = float(np.percentile(ep_scores[:, 0], smax_percentile))
+    return ep_table, s_max
+
+
 # ================= UTILS =================
 def latency_stats(times_ms):
     if not times_ms:
