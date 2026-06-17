@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """
-TopLoc-HNSW evaluation — PURE PYTHON, no C++ module needed.
+QLR (Query Log Router) evaluation — PURE PYTHON, no C++ module needed.
 
+Implements "HNSW Graph Meets Query Logs" (the toploc2 paper) on top of a
+standard HNSW document index. Algorithm 1, per query:
+  - search a query-log index I_Q for the closest historical queries; let s be
+    the similarity to the closest one.
+  - if s < th: fall back to a plain HNSW search on the document index.
+  - else: gather the precomputed document neighbours of the matched log queries
+    (lookup table EP) into a seed set C, shrink efSearch adaptively from s, and
+    run a level-0 beam search on the document index seeded from C.
 
-Logic:
-  - q0 of each conversation: normal FAISS HNSW search with higher efSearch
-    (ef_search * up). The best q0 result(s) become privileged entry point(s).
-  - follow-up turns: custom Python level-0 HNSW beam search starts from the
-    cached q0 entry point(s).
-  - evaluation metrics are computed with ir_measures: nDCG@3, nDCG@10, RR@10.
-  - latency is measured separately from correctness, using the same
-    per-conversation timing style as the baseline:
-      first query searched alone, follow-ups handled per conversation.
+The seeded beam search reuses the TopLoc-HNSW level-0 kernel (FAISS exposes no
+API to seed HNSW entry points). Metrics via ir_measures (nDCG@3/10, RR@10);
+latency is measured separately, split into routed vs fallback queries.
 
-Important:
-  FAISS Python does not expose a public API to search HNSW from a custom entry
-  point. Therefore the follow-up search is implemented in Python. This is useful
-  to test correctness and TopLoc logic, but real latency should later be tested
-  with the C++/native implementation.
+Status: rough logic build. The real historical query log is not wired up yet
+(see build_query_log); --log-source self reuses the eval queries so the whole
+pipeline runs end-to-end for sanity checks.
 
 Run examples:
-    python -u toploc_hnsw_pure_python.py snowflake
-    EF_SEARCH=64 UP=2 ENTRY_POINTS=1 python -u toploc_hnsw_pure_python.py snowflake
-    MMAP=1 python -u toploc_hnsw_pure_python.py snowflake --max-turns 20
+    python -u toploc2_hnsw_pure_python.py snowflake
+    TH=0.5 EF_DEFAULT=100 EF_MIN=10 K_EP=10 python -u toploc2_hnsw_pure_python.py dragon --max-turns 50
+    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --max-turns 20
 """
 
 import argparse
@@ -399,6 +399,26 @@ def route(q, iq, ep_table, index_d, graph, s_max,
     return scores[0], idx[0], visited, True, s
 
 
+# ================= QLR STEP 4a — QUERY LOG SOURCE (placeholder) =================
+def build_query_log(query_matrix, source="self"):
+    """Return the historical query log Q_L as an (n_log, dim) normalised matrix.
+
+    PLACEHOLDER — the real historical log (a held-out / external query set) is
+    not wired up yet. With source="self" we reuse the evaluation queries
+    themselves so the whole QLR pipeline runs end-to-end. This is degenerate
+    (every query then has a near-identical match in the log, so everything
+    routes) and is only for plumbing/sanity checks, not real numbers. Wire a
+    real log in here later.
+    """
+    if source == "self":
+        print(
+            "  WARN: using EVAL queries as the query log (placeholder Q_L). "
+            "Wire a real historical log here later."
+        )
+        return np.ascontiguousarray(query_matrix, dtype="float32")
+    raise NotImplementedError(f"query-log source '{source}' not wired up yet")
+
+
 # ================= UTILS =================
 def latency_stats(times_ms):
     if not times_ms:
@@ -422,14 +442,23 @@ def add_to_run(run, turn_key, scores_row, indices_row, id_map):
             run[turn_key][pid] = float(score)
 
 
-# ================= MAIN =================
+# ================= MAIN (QLR STEPS 4b–4d) =================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model", choices=["snowflake", "dragon"], nargs="?", default="snowflake")
-    parser.add_argument("--ef-search", type=int, default=int(os.environ.get("EF_SEARCH", 64)))
-    parser.add_argument("--up", type=int, default=int(os.environ.get("UP", 2)))
-    parser.add_argument("--entry-points", type=int, default=int(os.environ.get("ENTRY_POINTS", 1)))
     parser.add_argument("--k", type=int, default=int(os.environ.get("K", 10)))
+    parser.add_argument("--k-prime", type=int, default=int(os.environ.get("K_PRIME", 10)),
+                        help="k': log queries retrieved from I_Q per incoming query")
+    parser.add_argument("--th", type=float, default=float(os.environ.get("TH", 0.5)),
+                        help="similarity threshold; below it the query is not routed")
+    parser.add_argument("--ef-default", type=int, default=int(os.environ.get("EF_DEFAULT", 100)),
+                        help="upper bound of adaptive ef' and the fallback efSearch")
+    parser.add_argument("--ef-min", type=int, default=int(os.environ.get("EF_MIN", 10)),
+                        help="lower bound of adaptive ef' (confident routes)")
+    parser.add_argument("--k-ep", type=int, default=int(os.environ.get("K_EP", 10)),
+                        help="entry points stored per log query in EP")
+    parser.add_argument("--log-source", default=os.environ.get("LOG_SOURCE", "self"),
+                        help="where Q_L comes from (placeholder; 'self' for now)")
     parser.add_argument("--max-turns", type=int, default=0, help="Debug limit. 0 means all eval turns.")
     parser.add_argument("--threads", type=int, default=int(os.environ.get("THREADS", os.cpu_count() or 1)))
     args = parser.parse_args()
@@ -443,7 +472,7 @@ def main():
     topics_path = os.path.join(DATASET_DIR, "topics.tsv")
     qrels_path = os.path.join(DATASET_DIR, "qrels.qrel")
 
-    print(f"Evaluating TopLoc-HNSW PURE PYTHON for: {model_name}", flush=True)
+    print(f"Evaluating QLR (Query Log Router) PURE PYTHON for: {model_name}", flush=True)
     print(f"FAISS threads: {faiss.omp_get_max_threads()}", flush=True)
     print(f"Index path: {index_path}", flush=True)
 
@@ -459,15 +488,8 @@ def main():
 
     if not hasattr(index, "hnsw"):
         raise TypeError("Loaded index is not an HNSW index.")
-
-    index.hnsw.efSearch = args.ef_search
     print(
         f"Loaded HNSW index: ntotal={index.ntotal:,}, dim={index.d}, mmap={USE_MMAP}",
-        flush=True,
-    )
-    print(
-        f"Base efSearch={args.ef_search}, q0 efSearch={args.ef_search * args.up}, "
-        f"entry_points={args.entry_points}",
         flush=True,
     )
 
@@ -521,187 +543,123 @@ def main():
             flush=True,
         )
 
-    # Group encoded rows by conversation, preserving eval order.
-    conv_rows = defaultdict(list)
-    for row, key in enumerate(eval_keys):
-        conv_rows[key.split("_")[0]].append(row)
-    for conv_id in conv_rows:
-        conv_rows[conv_id].sort(key=lambda r: turn_sort_key(eval_keys[r]))
+    k = args.k
 
-    first_rows = [rows[0] for rows in conv_rows.values()]
-    followup_rows_per_conv = [rows[1:] for rows in conv_rows.values()]
-    first_n = len(first_rows)
-    followup_n = sum(len(rows) for rows in followup_rows_per_conv)
+    # ================= 4b. BUILD QLR (I_Q, EP, s_max) =================
+    print("\nBuilding Query Log Router...", flush=True)
+    log_emb = build_query_log(query_matrix, source=args.log_source)
+    t0 = time.perf_counter()
+    iq = build_query_log_index(log_emb)
+    ep_table, s_max = build_lookup_table(index, log_emb, k_ep=args.k_ep)
+    build_ms = (time.perf_counter() - t0) * 1000
     print(
-        f"\nEval set: {N} turns ({first_n} first-turn, {followup_n} follow-up) "
-        f"across {len(conv_rows)} conversations",
+        f"  Q_L size={len(log_emb):,} | I_Q dim={iq.d} | k_ep={args.k_ep} | "
+        f"s_max={s_max:.4f} | th={args.th} | ef'∈[{args.ef_min},{args.ef_default}] | "
+        f"built in {build_ms:.1f} ms",
         flush=True,
     )
 
-    k = args.k
-
-    # ================= BUILD RUN (correctness, untimed) =================
-    # For TopLoc-HNSW, q0 must be searched first to get the privileged entry
-    # point. Follow-ups use the same cached entry point(s).
-    print("\nBuilding run dict with TopLoc-HNSW logic (untimed)...", flush=True)
+    # ================= 4c. BUILD RUN (correctness, untimed) =================
+    print("\nBuilding run dict with QLR routing (untimed)...", flush=True)
     run = defaultdict(dict)
-    conv_entry_points = {}
-    conv_q0_emb = {}
-    conv_followup_embs = {}
-    conv_followup_keys = {}
-    conv_visited_counts = defaultdict(list)
+    route_flags, sims, visited_counts = [], [], []
 
-    old_ef = index.hnsw.efSearch
-
-    for conv_i, (conv_id, rows) in enumerate(conv_rows.items(), start=1):
-        q0_row = rows[0]
-        q0_key = eval_keys[q0_row]
-        q0_emb = query_matrix[q0_row : q0_row + 1]
-        conv_q0_emb[conv_id] = q0_emb
-
-        # q0: full/native HNSW with upscaled efSearch.
-        index.hnsw.efSearch = args.ef_search * args.up
-        q0_scores, q0_indices = index.search(q0_emb, max(k, args.entry_points))
-        index.hnsw.efSearch = old_ef
-
-        entry_points = [int(x) for x in q0_indices[0][: args.entry_points] if int(x) >= 0]
-        if not entry_points:
-            continue
-        conv_entry_points[conv_id] = entry_points
-        add_to_run(run, q0_key, q0_scores[0][:k], q0_indices[0][:k], id_map)
-
-        fu_rows = rows[1:]
-        if fu_rows:
-            fu_embs = np.ascontiguousarray(query_matrix[fu_rows], dtype="float32")
-            fu_keys = [eval_keys[r] for r in fu_rows]
-            conv_followup_embs[conv_id] = fu_embs
-            conv_followup_keys[conv_id] = fu_keys
-
-            # The pure Python search handles one query at a time, but the
-            # follow-up embeddings are stored as the per-conversation batch.
-            for local_i, turn_key in enumerate(fu_keys):
-                scores, indices, visited = toploc_hnsw_level0_search(
-                    index=index,
-                    graph=graph,
-                    q_emb=fu_embs[local_i : local_i + 1],
-                    entry_points=entry_points,
-                    k=k,
-                    ef_search=args.ef_search,
-                )
-                add_to_run(run, turn_key, scores[0], indices[0], id_map)
-                conv_visited_counts[conv_id].append(visited)
-
-        if conv_i % 5 == 0 or conv_i == len(conv_rows):
-            print(f"  built run for conv {conv_i}/{len(conv_rows)}", flush=True)
-
-    index.hnsw.efSearch = old_ef
-
-    print(f"DEBUG: I have {len(run)} turns in my run dict.", flush=True)
+    for row, turn_key in enumerate(eval_keys):
+        scores_row, idx_row, visited, routed, s = route(
+            query_matrix[row : row + 1], iq, ep_table, index, graph, s_max,
+            k=k, k_prime=args.k_prime, th=args.th,
+            ef_default=args.ef_default, ef_min=args.ef_min,
+        )
+        add_to_run(run, turn_key, scores_row, idx_row, id_map)
+        route_flags.append(routed)
+        sims.append(s)
+        if visited is not None:
+            visited_counts.append(visited)
+        if (row + 1) % 50 == 0 or (row + 1) == N:
+            print(f"  routed {sum(route_flags)}/{row + 1}", flush=True)
 
     measures = [nDCG @ 3, nDCG @ k, RR @ k]
     results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
 
-    # ================= TIMING: PER-CONVERSATION SWEEP =================
+    # ================= 4d. TIMING: PER-QUERY SWEEP =================
     def timed_sweep():
-        """One full pass: q0 single + follow-up batch per conversation.
-
-        In this pure Python version, follow-up embeddings are batched per
-        conversation, but the custom level-0 search is still called once per
-        follow-up query because FAISS Python has no custom-entry-point batch API.
-        """
-        first_total_ms, followup_total_ms = 0.0, 0.0
-        visited_counts = []
-
-        for conv_id, rows in conv_rows.items():
-            if conv_id not in conv_entry_points:
-                continue
-
-            q0_emb = conv_q0_emb[conv_id]
-            old = index.hnsw.efSearch
-            index.hnsw.efSearch = args.ef_search * args.up
+        """One full pass over all eval queries; split routed vs fallback time."""
+        routed_ms, fallback_ms = 0.0, 0.0
+        routed_cnt, fallback_cnt = 0, 0
+        for row in range(N):
+            q = query_matrix[row : row + 1]
             t0 = time.perf_counter()
-            index.search(q0_emb, max(k, args.entry_points))
-            first_total_ms += (time.perf_counter() - t0) * 1000
-            index.hnsw.efSearch = old
-
-            if conv_id in conv_followup_embs:
-                fu_embs = conv_followup_embs[conv_id]
-                entry_points = conv_entry_points[conv_id]
-                t0 = time.perf_counter()
-                for i in range(fu_embs.shape[0]):
-                    _, _, visited = toploc_hnsw_level0_search(
-                        index=index,
-                        graph=graph,
-                        q_emb=fu_embs[i : i + 1],
-                        entry_points=entry_points,
-                        k=k,
-                        ef_search=args.ef_search,
-                    )
-                    visited_counts.append(visited)
-                followup_total_ms += (time.perf_counter() - t0) * 1000
-
-        return first_total_ms, followup_total_ms, visited_counts
+            _, _, _, routed, _ = route(
+                q, iq, ep_table, index, graph, s_max,
+                k=k, k_prime=args.k_prime, th=args.th,
+                ef_default=args.ef_default, ef_min=args.ef_min,
+            )
+            dt = (time.perf_counter() - t0) * 1000
+            if routed:
+                routed_ms += dt
+                routed_cnt += 1
+            else:
+                fallback_ms += dt
+                fallback_cnt += 1
+        return routed_ms, fallback_ms, routed_cnt, fallback_cnt
 
     print(
-        f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed "
-        "per-conversation sweeps...",
+        f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed per-query sweeps...",
         flush=True,
     )
     for _ in range(BATCH_WARMUP_RUNS):
         timed_sweep()
 
-    first_times, followup_times, all_visited = [], [], []
+    routed_times, fallback_times = [], []
+    routed_n = fallback_n = 0
     for run_i in range(BATCH_TIMED_RUNS):
-        f_ms, u_ms, visited = timed_sweep()
-        first_times.append(f_ms)
-        followup_times.append(u_ms)
-        all_visited.extend(visited)
-        f_pq = f_ms / first_n if first_n else float("nan")
-        u_pq = u_ms / followup_n if followup_n else float("nan")
+        r_ms, f_ms, routed_n, fallback_n = timed_sweep()
+        routed_times.append(r_ms)
+        fallback_times.append(f_ms)
+        r_pq = r_ms / routed_n if routed_n else float("nan")
+        f_pq = f_ms / fallback_n if fallback_n else float("nan")
         print(
-            f"  run {run_i + 1}: first-turn total={f_ms:7.2f} ms (per-query={f_pq:.3f}) | "
-            f"follow-up total={u_ms:7.2f} ms (per-query={u_pq:.3f})",
+            f"  run {run_i + 1}: routed total={r_ms:7.2f} ms (per-query={r_pq:.3f}) | "
+            f"fallback total={f_ms:7.2f} ms (per-query={f_pq:.3f})",
             flush=True,
         )
 
-    f_min, f_med, f_mean = latency_stats(first_times)
-    u_min, u_med, u_mean = latency_stats(followup_times)
-    overall_times = [f + u for f, u in zip(first_times, followup_times)]
+    # ================= RESULTS =================
+    r_min, r_med, r_mean = latency_stats(routed_times)
+    f_min, f_med, f_mean = latency_stats(fallback_times)
+    overall_times = [r + f for r, f in zip(routed_times, fallback_times)]
     o_min, o_med, o_mean = latency_stats(overall_times)
 
     print("\n" + "=" * 70)
-    print(f"TOPLOC-HNSW PURE PYTHON RESULTS ({model_name})")
+    print(f"QLR PURE PYTHON RESULTS ({model_name})")
     print("=" * 70)
-    print(
-        f"Turns evaluated: {N}  ({first_n} first-turn, {followup_n} follow-up, "
-        f"{len(conv_rows)} conversations)"
-    )
+    print(f"Turns evaluated: {N}  ({routed_n} routed, {fallback_n} fallback)")
+    print(f"Route rate:      {sum(route_flags) / N:.1%}  (s>=th)")
+    print(f"Avg similarity:  {np.mean(sims):.4f}  (s_max={s_max:.4f}, th={args.th})")
     print(f"NDCG@3:  {results[nDCG @ 3]:.4f}")
     print(f"NDCG@10: {results[nDCG @ k]:.4f}")
     print(f"MRR@10:  {results[RR @ k]:.4f}")
     print()
     print(
-        f"Latency, summed over conversations (min / median / mean over "
+        f"Latency, summed over queries (min / median / mean over "
         f"{BATCH_TIMED_RUNS} sweeps):"
     )
-    print(f"  first-turn total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
-    print(f"  first-turn per query: {per_query_line((f_min, f_med, f_mean), first_n)}")
-    print(f"  follow-up  total:     {u_min:8.2f}  /  {u_med:8.2f}  /  {u_mean:8.2f}  ms")
-    print(f"  follow-up  per query: {per_query_line((u_min, u_med, u_mean), followup_n)}")
-    print(f"  overall    total:     {o_min:8.2f}  /  {o_med:8.2f}  /  {o_mean:8.2f}  ms")
+    print(f"  routed   total:     {r_min:8.2f}  /  {r_med:8.2f}  /  {r_mean:8.2f}  ms")
+    print(f"  routed   per query: {per_query_line((r_min, r_med, r_mean), routed_n)}")
+    print(f"  fallback total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
+    print(f"  fallback per query: {per_query_line((f_min, f_med, f_mean), fallback_n)}")
+    print(f"  overall  total:     {o_min:8.2f}  /  {o_med:8.2f}  /  {o_mean:8.2f}  ms")
     print(
-        f"  overall    per query: {per_query_line((o_min, o_med, o_mean), N)}"
+        f"  overall  per query: {per_query_line((o_min, o_med, o_mean), N)}"
         "   <- compare to paper Time"
     )
     print()
-    print(f"Base efSearch:            {args.ef_search}")
-    print(f"q0 efSearch:              {args.ef_search * args.up}")
-    print(f"Cached entry points/conv: {args.entry_points}")
-    if all_visited:
-        print(f"Avg visited nodes:        {np.mean(all_visited):.1f}")
+    print(f"th={args.th}  k'={args.k_prime}  k_ep={args.k_ep}  ef'∈[{args.ef_min},{args.ef_default}]")
+    if visited_counts:
+        print(f"Avg visited nodes (routed): {np.mean(visited_counts):.1f}")
     print("=" * 70)
-    print("NOTE: Follow-up search uses Python level-0 beam search.")
-    print("It tests TopLoc-HNSW correctness, but real latency needs the C++/native version.")
+    print("NOTE: routed search uses the pure-Python level-0 beam search and the")
+    print("Q_L placeholder; real latency/numbers need the C++ kernel + a real log.")
 
 
 if __name__ == "__main__":
