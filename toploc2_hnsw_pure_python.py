@@ -284,6 +284,34 @@ def toploc_hnsw_level0_search(index, graph, q_emb, entry_points, k=10, ef_search
     return scores, indices, len(visited)
 
 
+# ================= QLR STEP 1 — QUERY LOG INDEX (I_Q) =================
+def build_query_log_index(log_emb, m=32, ef_construction=500, ef_search=64):
+    """Build I_Q, the query-log index: an HNSW graph over the historical query
+    vectors Q_L. A new incoming query is searched here first, to find similar
+    past queries (Algorithm 1, line 1).
+
+    log_emb: (n_log, d) float32, L2-normalised historical query vectors.
+
+    Metric is METRIC_INNER_PRODUCT, matching the document index. Because the
+    vectors are L2-normalised, an inner-product search returns cosine
+    similarities directly — so the top-1 score is the routing similarity s, on
+    the same [-1, 1] scale as the threshold th and the reference s_max used in
+    later steps.
+
+    HNSW knobs — none of these is the number of vectors; the index holds every
+    vector passed to add():
+        m               graph degree (edges per node; level 0 gets 2*m). Paper: 32.
+        ef_construction build-time candidate list — graph quality vs build time. Paper: 500.
+        ef_search       query-time beam width — recall vs speed. Paper sweeps 10–200.
+    """
+    d = log_emb.shape[1]
+    iq = faiss.IndexHNSWFlat(d, m, faiss.METRIC_INNER_PRODUCT)
+    iq.hnsw.efConstruction = ef_construction
+    iq.add(np.ascontiguousarray(log_emb, dtype="float32"))
+    iq.hnsw.efSearch = ef_search
+    return iq
+
+
 # ================= UTILS =================
 def latency_stats(times_ms):
     if not times_ms:
