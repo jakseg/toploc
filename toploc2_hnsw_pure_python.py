@@ -346,6 +346,59 @@ def build_lookup_table(index_d, log_emb, k_ep=10, ep_build_ef_search=512, smax_p
     return ep_table, s_max
 
 
+# ================= QLR STEP 3 — ROUTING (Algorithm 1) =================
+def adaptive_ef_search(s, s_max, th, ef_default, ef_min):
+    """Shrink the beam width as routing confidence s grows (Alg. 1, lines 6-9).
+        s >= s_max -> ef_min       (very confident: seeds are basically on target)
+        s == th    -> ef_default   (barely routed: search as widely as usual)
+        between    -> linear interpolation.
+    The mechanism + the (s_max - s)/(s_max - th) factor are from the paper.
+    ef_min is our choice (the paper interpolates down to a minimum but doesn't pin it).
+    """
+    if s_max <= th:                              # degenerate calibration
+        return ef_min
+    frac = (s_max - s) / (s_max - th)            # 0 at s_max, 1 at th
+    frac = min(max(frac, 0.0), 1.0)              # clamp: s may exceed s_max
+    return int(round(ef_min + (ef_default - ef_min) * frac))
+
+
+def route(q, iq, ep_table, index_d, graph, s_max,
+          k=10, k_prime=10, th=0.5, ef_default=512, ef_min=16):
+    """Route one query (Alg. 1). Returns (scores, indices, visited, routed, s);
+    visited is None on the fallback path (native FAISS gives no count).
+
+    ef_default is the upper bound of the adaptive ef' and the efSearch used on
+    the fallback path; set it to the HNSW baseline operating point you compare
+    against (the efSearch sweep includes 512).
+    """
+    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+
+    # 1-2. Closest historical queries. I_Q is inner-product on normalised
+    #      vectors, so the returned score IS the cosine similarity s.
+    sims, log_idx = iq.search(q, k_prime)
+    s = float(sims[0, 0])
+    matched = [int(i) for i in log_idx[0] if i >= 0]
+
+    # 3-4. Not similar enough -> plain HNSW search on the document index.
+    if not matched or s < th:
+        old_ef = index_d.hnsw.efSearch
+        index_d.hnsw.efSearch = ef_default
+        f_scores, f_idx = index_d.search(q, k)
+        index_d.hnsw.efSearch = old_ef
+        return f_scores[0], f_idx[0], None, False, s
+
+    # 5. Candidate set C = union of the matched log queries' precomputed docs.
+    C = np.unique(ep_table[matched].ravel())
+    C = C[C >= 0]
+
+    # 6-9 / 10. Adaptive beam width, then seeded level-0 search from C.
+    ef = max(adaptive_ef_search(s, s_max, th, ef_default, ef_min), k)
+    scores, idx, visited = toploc_hnsw_level0_search(
+        index_d, graph, q, entry_points=C, k=k, ef_search=ef
+    )
+    return scores[0], idx[0], visited, True, s
+
+
 # ================= UTILS =================
 def latency_stats(times_ms):
     if not times_ms:
