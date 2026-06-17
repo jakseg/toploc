@@ -19,17 +19,23 @@ faiss.omp_set_num_threads(int(os.environ.get("FAISS_THREADS", os.cpu_count() or 
 print(f"FAISS threads: {faiss.omp_get_max_threads()} (of {os.cpu_count()} cores)")
 
 # ================= CONFIGURATION =================
-EMBEDDINGS_BASE = "/home/toploc2/Datasets/conversational/CAST2019"
-CACHE_BASE = "/home/toploc2/Datasets/toploc2"
-
-EMBEDDING_DIRS = {
-    "snowflake": os.path.join(EMBEDDINGS_BASE, "snowflake_embeddings"),
-    "dragon": os.path.join(EMBEDDINGS_BASE, "dragon_embeddings"),
-}
-
-CACHE_DIRS = {
-    "snowflake": os.path.join(CACHE_BASE, "snowflake"),
-    "dragon": os.path.join(CACHE_BASE, "dragon"),
+# Per-dataset paths. CAST2019 is the first paper (38M collection); msmarco is the
+# QLR (toploc2) collection (~8.8M). msmarco lands in its own cache subdir so it
+# does not clobber the CAST2019 indexes, and uses the paper's HNSW
+# ef_construction=500 (CAST used a project default of 200).
+DATASETS = {
+    "cast2019": {
+        "embeddings_base": "/home/toploc2/Datasets/conversational/CAST2019",
+        "emb_subdir": {"snowflake": "snowflake_embeddings", "dragon": "dragon_embeddings"},
+        "cache_base": "/home/toploc2/Datasets/toploc2",
+        "hnsw_ef_construction": 200,
+    },
+    "msmarco": {
+        "embeddings_base": "/home/toploc2/Datasets/conversational/msmarco",
+        "emb_subdir": {"snowflake": "snowflake", "dragon": "dragon"},
+        "cache_base": "/home/toploc2/Datasets/toploc2/msmarco",
+        "hnsw_ef_construction": 500,
+    },
 }
 
 # Paper parameters (Table 1, Section 3 — full 38M collection)
@@ -217,8 +223,14 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
 
 
 # ================= MAIN =================
+# Usage: create_index.py <model> <index_type> [dataset]   (dataset default cast2019)
 model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
 type_arg = sys.argv[2] if len(sys.argv) > 2 else "ivf"
+dataset = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("DATASET", "cast2019")
+
+if dataset not in DATASETS:
+    print(f"Unknown dataset: {dataset}. Use one of {tuple(DATASETS)}.")
+    sys.exit(1)
 
 if type_arg == "all":
     index_types = list(VALID_INDEX_TYPES)
@@ -229,13 +241,19 @@ else:
             print(f"Unknown index type: {t}. Use one of {VALID_INDEX_TYPES} or 'all'.")
             sys.exit(1)
 
-emb_dir = EMBEDDING_DIRS[model_name]
-cache_dir = CACHE_DIRS[model_name]
+ds = DATASETS[dataset]
+emb_dir = os.path.join(ds["embeddings_base"], ds["emb_subdir"][model_name])
+cache_dir = os.path.join(ds["cache_base"], model_name)
 os.makedirs(cache_dir, exist_ok=True)
 
+# Dataset-specific HNSW build quality (QLR paper uses 500; CAST used 200).
+for m in INDEX_PARAMS:
+    if "hnsw" in INDEX_PARAMS[m]:
+        INDEX_PARAMS[m]["hnsw"]["ef_construction"] = ds["hnsw_ef_construction"]
+
 parquet_files, dim = get_parquet_info(emb_dir)
-print(f"Model: {model_name} | Types: {index_types} | "
-      f"{len(parquet_files)} parquet files, dim={dim}")
+print(f"Dataset: {dataset} | Model: {model_name} | Types: {index_types} | "
+      f"{len(parquet_files)} parquet files, dim={dim} | cache={cache_dir}")
 
 for it in index_types:
     print(f"\n{'=' * 60}\nBuilding: {it}\n{'=' * 60}")

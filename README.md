@@ -24,17 +24,20 @@ Outputs are saved to `data/snowflake/` and `data/dragon/` respectively.
 ### 2. Build Index
 
 ```bash
-python create_index.py <model> <index_type>
+python create_index.py <model> <index_type> [dataset]
 ```
 
 - `model`: `snowflake` or `dragon`
 - `index_type`: `exact`, `ivf`, `hnsw`, a comma-separated list (e.g. `exact,ivf`), or `all`
+- `dataset`: `cast2019` (default) or `msmarco` (the QLR/toploc2 collection; lands in
+  its own `toploc2/msmarco/<model>/` cache and builds HNSW with `ef_construction=500`)
 
 Examples:
 ```bash
-python create_index.py snowflake ivf           # single index
-python create_index.py snowflake exact,ivf     # build two sequentially
-python create_index.py snowflake all           # exact + ivf + hnsw
+python create_index.py snowflake ivf            # CAST2019 (default)
+python create_index.py snowflake exact,ivf      # build two sequentially
+python create_index.py snowflake all            # exact + ivf + hnsw
+python create_index.py snowflake hnsw msmarco   # QLR document index (msmarco)
 ```
 
 The build streams embeddings from parquet and checkpoints every 50 files
