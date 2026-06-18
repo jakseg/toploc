@@ -26,6 +26,7 @@ Run examples:
 """
 
 import argparse
+import glob
 import heapq
 import os
 import re
@@ -34,6 +35,7 @@ import time
 from collections import defaultdict
 
 import numpy as np
+import pyarrow.parquet as pq
 import faiss
 import ir_measures
 from ir_measures import nDCG, RR
@@ -49,6 +51,20 @@ CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
     "dragon": os.path.join(CACHE_BASE, "dragon"),
 }
+
+# msmarco (QLR / toploc2): the collection HNSW index lives in its own cache; the
+# dev queries (test set), train queries (Q_L = historical log) and dev qrels live
+# under MSMARCO_BASE. All query embeddings are parquet shards (id + embedding).
+MSMARCO_CACHE_DIRS = {
+    "snowflake": os.path.join(CACHE_BASE, "msmarco", "snowflake"),
+    "dragon": os.path.join(CACHE_BASE, "msmarco", "dragon"),
+}
+MSMARCO_BASE = os.environ.get(
+    "MSMARCO_BASE", "/home/toploc2/Datasets/conversational/CAST2019/msmarco"
+)
+MSMARCO_DEV_QUERY_DIR = os.path.join(MSMARCO_BASE, "msmarco_embeddings", "dev_query")
+MSMARCO_TRAIN_QUERY_DIR = os.path.join(MSMARCO_BASE, "msmarco_embeddings", "train_query")
+MSMARCO_QRELS = os.path.join(MSMARCO_BASE, "qrels.dev.small.tsv")
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 BATCH_WARMUP_RUNS = int(os.environ.get("BATCH_WARMUP_RUNS", 2))
@@ -167,11 +183,12 @@ def load_topics(path):
 
 
 def load_qrels(path):
-    """Load qrels.qrel. In this project it is comma-separated: qid,iter,pid,score."""
+    """Load qrels: `qid iter pid score`. Delimiter-flexible — CAST uses commas
+    (`31_1,0,CAR_..,1`), msmarco uses tabs (`174249\t0\t1092925\t1`)."""
     qrels = defaultdict(dict)
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            parts = line.strip().split(",")
+            parts = re.split(r"[\t,]", line.strip())
             if len(parts) != 4:
                 continue
             qid, _, pid, score = parts
@@ -190,6 +207,31 @@ def turn_sort_key(turn_key):
     """Sort keys like '31_1', '31_2', ... in conversation order."""
     numbers = re.findall(r"\d+", turn_key)
     return tuple(int(x) for x in numbers) if numbers else (10**9,)
+
+
+def load_parquet_embeddings(emb_dir):
+    """Load all *.parquet shards in emb_dir → (ids, (N,d) float32, L2-normalised).
+
+    Used for the msmarco query-embedding dirs (dev_query = test, train_query =
+    Q_L). Each shard has an `id` (string) and `embedding` (list<float>) column;
+    the shards are concatenated in filename order.
+    """
+    files = sorted(glob.glob(os.path.join(emb_dir, "*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"No parquet files in {emb_dir}")
+    ids, mats = [], []
+    for f in files:
+        t = pq.read_table(f, columns=["id", "embedding"])
+        ids.extend(str(x) for x in t.column("id").to_pylist())
+        d = len(t.column("embedding")[0].as_py())
+        try:
+            flat = t.column("embedding").combine_chunks().values.to_numpy(zero_copy_only=False)
+            mats.append(flat.reshape(-1, d).astype("float32"))
+        except Exception:
+            mats.append(np.array(t.column("embedding").to_pylist(), dtype="float32"))
+    emb = np.ascontiguousarray(np.vstack(mats), dtype="float32")
+    faiss.normalize_L2(emb)
+    return ids, emb
 
 
 # ================= HNSW GRAPH ACCESS =================
@@ -458,7 +500,12 @@ def main():
     parser.add_argument("--k-ep", type=int, default=int(os.environ.get("K_EP", 10)),
                         help="entry points stored per log query in EP")
     parser.add_argument("--log-source", default=os.environ.get("LOG_SOURCE", "self"),
-                        help="where Q_L comes from (placeholder; 'self' for now)")
+                        help="where Q_L comes from for cast2019 (placeholder; 'self')")
+    parser.add_argument("--dataset", default=os.environ.get("DATASET", "cast2019"),
+                        choices=["cast2019", "msmarco"],
+                        help="cast2019 (default) or msmarco (QLR collection + train-query log)")
+    parser.add_argument("--log-limit", type=int, default=int(os.environ.get("LOG_LIMIT", 0)),
+                        help="cap |Q_L| for quick runs (0 = full log)")
     parser.add_argument("--max-turns", type=int, default=0, help="Debug limit. 0 means all eval turns.")
     parser.add_argument("--threads", type=int, default=int(os.environ.get("THREADS", os.cpu_count() or 1)))
     args = parser.parse_args()
@@ -466,13 +513,12 @@ def main():
     faiss.omp_set_num_threads(args.threads)
 
     model_name = args.model
-    cache_dir = CACHE_DIRS[model_name]
+    dataset = args.dataset
+    cache_dir = (MSMARCO_CACHE_DIRS if dataset == "msmarco" else CACHE_DIRS)[model_name]
     index_path = os.path.join(cache_dir, "hnsw_index.index")
     ids_path = os.path.join(cache_dir, "hnsw_ids.npy")
-    topics_path = os.path.join(DATASET_DIR, "topics.tsv")
-    qrels_path = os.path.join(DATASET_DIR, "qrels.qrel")
 
-    print(f"Evaluating QLR (Query Log Router) PURE PYTHON for: {model_name}", flush=True)
+    print(f"Evaluating QLR (Query Log Router) PURE PYTHON for: {model_name} [{dataset}]", flush=True)
     print(f"FAISS threads: {faiss.omp_get_max_threads()}", flush=True)
     print(f"Index path: {index_path}", flush=True)
 
@@ -502,52 +548,68 @@ def main():
     indexed_pids = set(id_map.values())
     print(f"ID map loaded: {len(id_map):,} passages", flush=True)
 
-    topics = load_topics(topics_path)
+    # ---- qrels (delimiter-flexible: CAST commas / msmarco tabs) ----
+    qrels_path = MSMARCO_QRELS if dataset == "msmarco" else os.path.join(DATASET_DIR, "qrels.qrel")
     qrels = load_qrels(qrels_path)
-    if not topics:
-        raise RuntimeError("Parsed 0 topics. Check topics.tsv delimiter/format.")
-
     filtered_qrels = {}
     for turn_key, pid_scores in qrels.items():
         valid_pids = {pid: s for pid, s in pid_scores.items() if pid in indexed_pids}
         if valid_pids:
             filtered_qrels[turn_key] = valid_pids
-
     if not filtered_qrels:
         raise RuntimeError("No qrels survived filtering against indexed passage ids.")
 
-    # Stable evaluation order: topics order, only judged turns.
-    eval_keys = [k for k in topics if k in filtered_qrels]
-    if args.max_turns:
-        eval_keys = eval_keys[: args.max_turns]
-    eval_queries = [topics[k] for k in eval_keys]
-    N = len(eval_keys)
-
-    print(f"Topics loaded: {len(topics):,} turns", flush=True)
-    print(f"Turns with relevant passages in index: {len(filtered_qrels):,}/{len(qrels):,}", flush=True)
-    print(f"Eval turns used: {N:,}", flush=True)
-
-    # ================= OBTAIN QUERY EMBEDDINGS =================
-    print(f"\nObtaining query embeddings for {N} queries...", flush=True)
-    query_matrix = load_precomputed_query_embeddings(model_name, eval_keys)
-    if query_matrix is None:
-        print(f"Loading {model_name} query encoder...", flush=True)
-        encode_batch = load_query_encoder(model_name)
-        print(f"Batch-encoding {N} queries...", flush=True)
-        t0 = time.perf_counter()
-        query_matrix = encode_batch(eval_queries)
-        enc_ms = (time.perf_counter() - t0) * 1000
-        print(
-            f"Query encoding done in {enc_ms:.1f} ms total "
-            f"({enc_ms / N:.2f} ms/query) — shape={query_matrix.shape}",
-            flush=True,
+    # ---- eval queries (test set) + their embeddings ----
+    if dataset == "msmarco":
+        # dev queries: precomputed embeddings in parquet shards, keyed by query id.
+        print(f"\nLoading msmarco dev-query embeddings from {MSMARCO_DEV_QUERY_DIR}...", flush=True)
+        q_ids, q_emb = load_parquet_embeddings(MSMARCO_DEV_QUERY_DIR)
+        id2row = {qid: i for i, qid in enumerate(q_ids)}
+        eval_keys = [qid for qid in q_ids if qid in filtered_qrels]
+        if args.max_turns:
+            eval_keys = eval_keys[: args.max_turns]
+        query_matrix = np.ascontiguousarray(
+            q_emb[[id2row[k] for k in eval_keys]], dtype="float32"
         )
+        N = len(eval_keys)
+        print(f"Dev queries with qrels in index: {N:,} (of {len(q_ids):,} embedded)", flush=True)
+    else:
+        topics = load_topics(os.path.join(DATASET_DIR, "topics.tsv"))
+        if not topics:
+            raise RuntimeError("Parsed 0 topics. Check topics.tsv delimiter/format.")
+        eval_keys = [k for k in topics if k in filtered_qrels]
+        if args.max_turns:
+            eval_keys = eval_keys[: args.max_turns]
+        eval_queries = [topics[k] for k in eval_keys]
+        N = len(eval_keys)
+        print(f"Topics: {len(topics):,} | eval turns: {N:,}", flush=True)
+        print(f"\nObtaining query embeddings for {N} queries...", flush=True)
+        query_matrix = load_precomputed_query_embeddings(model_name, eval_keys)
+        if query_matrix is None:
+            print(f"Loading {model_name} query encoder...", flush=True)
+            encode_batch = load_query_encoder(model_name)
+            t0 = time.perf_counter()
+            query_matrix = encode_batch(eval_queries)
+            enc_ms = (time.perf_counter() - t0) * 1000
+            print(f"Query encoding done in {enc_ms:.1f} ms ({enc_ms / N:.2f} ms/query)", flush=True)
+
+    if N == 0:
+        raise RuntimeError("No eval queries after aligning topics/qrels/embeddings.")
 
     k = args.k
 
     # ================= 4b. BUILD QLR (I_Q, EP, s_max) =================
+    # Q_L: msmarco uses the train-query split (the historical log); cast2019 uses
+    # the placeholder (--log-source self reuses the eval queries).
     print("\nBuilding Query Log Router...", flush=True)
-    log_emb = build_query_log(query_matrix, source=args.log_source)
+    if dataset == "msmarco":
+        print(f"Loading msmarco train-query log from {MSMARCO_TRAIN_QUERY_DIR}...", flush=True)
+        _, log_emb = load_parquet_embeddings(MSMARCO_TRAIN_QUERY_DIR)
+    else:
+        log_emb = build_query_log(query_matrix, source=args.log_source)
+    if args.log_limit:
+        log_emb = np.ascontiguousarray(log_emb[: args.log_limit], dtype="float32")
+        print(f"  Q_L capped to {len(log_emb):,} (via --log-limit)", flush=True)
     t0 = time.perf_counter()
     iq = build_query_log_index(log_emb)
     ep_table, s_max = build_lookup_table(index, log_emb, k_ep=args.k_ep)
