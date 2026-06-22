@@ -101,6 +101,12 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
     checkpoint_path = os.path.join(cache_dir, f"{index_type}_checkpoint.json")
     params = INDEX_PARAMS[model_name].get(index_type, {})
 
+    # dragon (dragon-plus) is trained for raw dot product — the embedding
+    # magnitude carries signal, so normalizing to cosine costs ~0.06 nDCG.
+    # snowflake (arctic-embed) is trained for cosine, so it must stay normalized.
+    normalize_vecs = model_name != "dragon"
+    log.info(f"[{index_type}] normalize_L2={normalize_vecs} (model={model_name})")
+
     # Resume or init
     start_file = 0
     all_ids = []
@@ -140,7 +146,8 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
             collected = 0
             for pf in shuffled:
                 _, embs = read_parquet(pf, dim)
-                faiss.normalize_L2(embs)
+                if normalize_vecs:
+                    faiss.normalize_L2(embs)
                 train_chunks.append(embs)
                 collected += len(embs)
                 if collected >= train_target:
@@ -181,7 +188,8 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
         pf = parquet_files[i]
         try:
             ids, embs = read_parquet(pf, dim)
-            faiss.normalize_L2(embs)
+            if normalize_vecs:
+                faiss.normalize_L2(embs)
             index.add(embs)
             all_ids.extend(ids)
         except Exception as e:
