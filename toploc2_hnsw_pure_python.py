@@ -23,6 +23,9 @@ Run examples:
     python -u toploc2_hnsw_pure_python.py snowflake
     TH=0.5 EF_DEFAULT=100 EF_MIN=10 K_EP=10 python -u toploc2_hnsw_pure_python.py dragon --max-turns 50
     MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --max-turns 20
+    # QLR on the real msmarco log/dev/qrels, searching the CAST2019 index as I_D
+    # (it already contains the msmarco passages); cap the log for a quick run:
+    python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast --log-limit 50000
 """
 
 import argparse
@@ -62,9 +65,22 @@ MSMARCO_CACHE_DIRS = {
 MSMARCO_BASE = os.environ.get(
     "MSMARCO_BASE", "/home/toploc2/Datasets/conversational/CAST2019/msmarco"
 )
-MSMARCO_DEV_QUERY_DIR = os.path.join(MSMARCO_BASE, "msmarco_embeddings", "dev_query")
+# dev queries (test set), per encoder. snowflake was precomputed (1024-d); the
+# dragon set (768-d) is produced once by encode_msmarco_dev_dragon.py into
+# dev_query_dragon/ (no precomputed dragon dev embeddings exist on the server).
+MSMARCO_DEV_QUERY_DIRS = {
+    "snowflake": os.path.join(MSMARCO_BASE, "msmarco_embeddings", "dev_query"),
+    "dragon": os.path.join(MSMARCO_BASE, "msmarco_embeddings", "dev_query_dragon"),
+}
 MSMARCO_TRAIN_QUERY_DIR = os.path.join(MSMARCO_BASE, "msmarco_embeddings", "train_query")
 MSMARCO_QRELS = os.path.join(MSMARCO_BASE, "qrels.dev.small.tsv")
+
+# Full msmarco train-query log (~808k rows = the paper's |Q_L|), separate from
+# the 367k train_query subset above. Used by --dataset msmarco-on-cast.
+MSMARCO_FULL_LOG_DIRS = {
+    "snowflake": "/home/toploc2/Datasets/conversational/msmarco/snowflake",
+    "dragon": "/home/toploc2/Datasets/conversational/msmarco/dragon",
+}
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
 BATCH_WARMUP_RUNS = int(os.environ.get("BATCH_WARMUP_RUNS", 2))
@@ -182,9 +198,15 @@ def load_topics(path):
     return topics
 
 
-def load_qrels(path):
+def load_qrels(path, pid_prefix=""):
     """Load qrels: `qid iter pid score`. Delimiter-flexible — CAST uses commas
-    (`31_1,0,CAR_..,1`), msmarco uses tabs (`174249\t0\t1092925\t1`)."""
+    (`31_1,0,CAR_..,1`), msmarco uses tabs (`174249\t0\t1092925\t1`).
+
+    pid_prefix is prepended to every pid. Used by msmarco-on-cast: the msmarco
+    qrels list bare numeric pids (`1092925`), but the CAST2019 index stores the
+    same passage as `MARCO_1092925`, so mapping `1092925` -> `MARCO_1092925`
+    aligns the qrels with the indexed pid space (the run side already emits the
+    `MARCO_<n>` form via id_map, so both sides match)."""
     qrels = defaultdict(dict)
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -199,7 +221,7 @@ def load_qrels(path):
             except ValueError:
                 continue
             if score > 0:
-                qrels[qid][pid] = score
+                qrels[qid][pid_prefix + pid] = score
     return qrels
 
 
@@ -502,8 +524,10 @@ def main():
     parser.add_argument("--log-source", default=os.environ.get("LOG_SOURCE", "self"),
                         help="where Q_L comes from for cast2019 (placeholder; 'self')")
     parser.add_argument("--dataset", default=os.environ.get("DATASET", "cast2019"),
-                        choices=["cast2019", "msmarco"],
-                        help="cast2019 (default) or msmarco (QLR collection + train-query log)")
+                        choices=["cast2019", "msmarco", "msmarco-on-cast"],
+                        help="cast2019 (default); msmarco (own QLR collection + train log); "
+                             "or msmarco-on-cast (CAST2019 index as I_D — it contains the "
+                             "msmarco passages as MARCO_<n> — with the msmarco log/dev/qrels)")
     parser.add_argument("--log-limit", type=int, default=int(os.environ.get("LOG_LIMIT", 0)),
                         help="cap |Q_L| for quick runs (0 = full log)")
     parser.add_argument("--max-turns", type=int, default=0, help="Debug limit. 0 means all eval turns.")
@@ -514,6 +538,13 @@ def main():
 
     model_name = args.model
     dataset = args.dataset
+    # msmarco-on-cast searches the CAST2019 index (which already contains every
+    # msmarco passage as MARCO_<n>, plus the CAR passages) using the msmarco
+    # log/dev/qrels. Both msmarco modes share the parquet query loaders and the
+    # msmarco qrels; they differ only in (a) which HNSW index is I_D and (b)
+    # whether qrels pids need the MARCO_ prefix to match the indexed pids.
+    msmarco_queries = dataset in ("msmarco", "msmarco-on-cast")
+    on_cast = dataset == "msmarco-on-cast"
     cache_dir = (MSMARCO_CACHE_DIRS if dataset == "msmarco" else CACHE_DIRS)[model_name]
     index_path = os.path.join(cache_dir, "hnsw_index.index")
     ids_path = os.path.join(cache_dir, "hnsw_ids.npy")
@@ -549,8 +580,8 @@ def main():
     print(f"ID map loaded: {len(id_map):,} passages", flush=True)
 
     # ---- qrels (delimiter-flexible: CAST commas / msmarco tabs) ----
-    qrels_path = MSMARCO_QRELS if dataset == "msmarco" else os.path.join(DATASET_DIR, "qrels.qrel")
-    qrels = load_qrels(qrels_path)
+    qrels_path = MSMARCO_QRELS if msmarco_queries else os.path.join(DATASET_DIR, "qrels.qrel")
+    qrels = load_qrels(qrels_path, pid_prefix="MARCO_" if on_cast else "")
     filtered_qrels = {}
     for turn_key, pid_scores in qrels.items():
         valid_pids = {pid: s for pid, s in pid_scores.items() if pid in indexed_pids}
@@ -560,10 +591,11 @@ def main():
         raise RuntimeError("No qrels survived filtering against indexed passage ids.")
 
     # ---- eval queries (test set) + their embeddings ----
-    if dataset == "msmarco":
+    if msmarco_queries:
         # dev queries: precomputed embeddings in parquet shards, keyed by query id.
-        print(f"\nLoading msmarco dev-query embeddings from {MSMARCO_DEV_QUERY_DIR}...", flush=True)
-        q_ids, q_emb = load_parquet_embeddings(MSMARCO_DEV_QUERY_DIR)
+        dev_dir = MSMARCO_DEV_QUERY_DIRS[model_name]
+        print(f"\nLoading msmarco dev-query embeddings from {dev_dir}...", flush=True)
+        q_ids, q_emb = load_parquet_embeddings(dev_dir)
         id2row = {qid: i for i, qid in enumerate(q_ids)}
         eval_keys = [qid for qid in q_ids if qid in filtered_qrels]
         if args.max_turns:
@@ -602,9 +634,12 @@ def main():
     # Q_L: msmarco uses the train-query split (the historical log); cast2019 uses
     # the placeholder (--log-source self reuses the eval queries).
     print("\nBuilding Query Log Router...", flush=True)
-    if dataset == "msmarco":
-        print(f"Loading msmarco train-query log from {MSMARCO_TRAIN_QUERY_DIR}...", flush=True)
-        _, log_emb = load_parquet_embeddings(MSMARCO_TRAIN_QUERY_DIR)
+    if msmarco_queries:
+        # msmarco-on-cast uses the full ~808k log; plain msmarco uses the 367k
+        # train_query subset that sits next to the (separate) msmarco collection.
+        log_dir = MSMARCO_FULL_LOG_DIRS[model_name] if on_cast else MSMARCO_TRAIN_QUERY_DIR
+        print(f"Loading msmarco train-query log from {log_dir}...", flush=True)
+        _, log_emb = load_parquet_embeddings(log_dir)
     else:
         log_emb = build_query_log(query_matrix, source=args.log_source)
     if args.log_limit:
