@@ -15,7 +15,13 @@ DATASET="${2:-msmarco-on-cast}"
 LOG_LIMIT="${LOG_LIMIT:-100000}"      # cap |Q_L| for a first pass; 0 = full log
 PY="${PY:-python}"
 
-export MMAP=1
+# mmap only affects ACCESS SPEED, not results — NDCG/MRR/Accuracy@10/avg_visited are
+# identical either way. combine_base_top_hnsw.py (the TopLoc-HNSW comparison) runs
+# WITHOUT mmap by default, so default to that here to stay comparable: full RAM load
+# (the ~157 GiB snowflake index then needs that much free RAM; slower to load, but
+# latency-comparable). Set MMAP=1 if RAM is tight — safe for accuracy/visited; only a
+# future real-latency comparison would then not match.
+export MMAP="${MMAP:-0}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="results_${MODEL}_${DATASET}_${TS}"

@@ -89,10 +89,16 @@ python test_qlr_pipeline.py       # synthetic, runs in seconds -> 12/12 passed
 
 ### Run order (on the server)
 
-All commands use `--dataset msmarco-on-cast`. The snowflake CAST index (~157 GiB)
-is larger than the free RAM on the shared node, so **always set `MMAP=1`** (a
-non-mmap load OOMs). `compute_groundtruth.py` is the exception — it streams the
-document embeddings and never loads the HNSW index.
+All commands use `--dataset msmarco-on-cast`.
+
+**On `MMAP`:** memory-mapping only changes how fast vectors are read from disk, not
+the results — NDCG/MRR/Accuracy@10 and `avg_visited` are identical with or without
+it. To stay latency-comparable to `combine_base_top_hnsw.py` (the TopLoc-HNSW
+comparison, which runs **without** mmap), leave `MMAP` unset (default off): the
+index is loaded fully into RAM, so the ~157 GiB snowflake index needs that much
+free RAM and loads slower. If RAM is tight, set `MMAP=1` — safe for accuracy/visited,
+only a real-latency comparison would then not match. (`compute_groundtruth.py` never
+loads the HNSW index, so mmap is irrelevant there.)
 
 **One-shot wrapper** (runs steps 1–4 below and tees logs to
 `results_<model>_<dataset>_<ts>/`):
@@ -119,13 +125,13 @@ Or the individual steps, in order:
 
 3. **plain-HNSW baseline** (the comparison) — sweep efSearch 10..200:
    ```bash
-   MMAP=1 python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
        --mode baseline --sweep --out baseline_sweep.csv
    ```
 
 4. **QLR sweep** (`th × k' × ef × PCA`; EP/s_max built once and reused):
    ```bash
-   MMAP=1 python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
        --sweep --log-limit 100000 --out qlr_sweep.csv
    ```
 
@@ -134,14 +140,16 @@ vs `qlr_sweep.csv`: QLR should reach about the **same Accuracy@10 as the baselin
 on the identical index. A quick single-config first run:
 
 ```bash
-MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
     --log-limit 2000 --max-turns 50
 ```
 
 Notes:
 - Pure-Python latency is **not real** — `avg_visited` (nodes scanned) is the
-  implementation-independent efficiency proxy. Reproducing the paper's latency
-  speedup needs the C++ kernel.
+  implementation-independent efficiency proxy, and it (like accuracy) is unaffected
+  by mmap or thread count. Reproducing the paper's latency speedup needs the C++
+  kernel; for that real-latency run, match `combine_base_top_hnsw.py` exactly (no
+  mmap, single-thread: `OMP_NUM_THREADS=1 ... --threads 1`).
 - snowflake `th` is cosine (default 0.5); dragon is raw dot product, so its `th`
   is calibrated from the data when unset.
 
