@@ -68,6 +68,118 @@ Quick sanity check with a single query:
 python test_ivf_pipeline.py <model>
 ```
 
+## QLR (Query Log Router — toploc2)
+
+Reimplementation of "HNSW Graph Meets Query Logs": a lightweight router in front
+of a standard HNSW document index. It runs on `msmarco-on-cast` — the CAST2019
+HNSW index is the document index `I_D` (it already contains every msmarco passage
+as `MARCO_<n>`), with the msmarco train split as the query log `Q_L` and the
+msmarco dev queries + `qrels.dev.small.tsv` as the test set.
+
+Driver: `toploc2_hnsw_pure_python.py` (pure Python, no C++). Two metrics are
+reported: **Accuracy@10** (fraction of the *exhaustive* top-10 retrieved — the
+paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
+
+### 0. Local sanity check (no server needed)
+
+```bash
+conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
+python test_qlr_pipeline.py       # synthetic, runs in seconds -> 14/14 passed
+```
+
+### Run order (on the server)
+
+All commands use `--dataset msmarco-on-cast`.
+
+**On `MMAP`:** memory-mapping only changes how fast vectors are read from disk, not
+the results — NDCG/MRR/Accuracy@10 and `avg_visited` are identical with or without
+it. To stay latency-comparable to `combine_base_top_hnsw.py` (the TopLoc-HNSW
+comparison, which runs **without** mmap), leave `MMAP` unset (default off): the
+index is loaded fully into RAM, so the ~157 GiB snowflake index needs that much
+free RAM and loads slower. If RAM is tight, set `MMAP=1` — safe for accuracy/visited,
+only a real-latency comparison would then not match. (`compute_groundtruth.py` never
+loads the HNSW index, so mmap is irrelevant there.)
+
+**One-shot wrapper** (runs steps 1–4 below and tees logs to
+`results_<model>_<dataset>_<ts>/`):
+
+```bash
+bash run_qlr_experiments.sh snowflake               # snowflake (data validated)
+bash run_qlr_experiments.sh dragon                  # encodes dev embeddings + smoke test first
+LOG_LIMIT=0 bash run_qlr_experiments.sh snowflake   # full ~808k log (default caps |Q_L| at 100k)
+```
+
+Or the individual steps, in order:
+
+1. **(dragon only)** encode the dev queries and validate the data:
+   ```bash
+   python encode_msmarco_dev_dragon.py
+   python smoke_test_msmarco_on_cast.py dragon       # expect ~100% qrels coverage, READY
+   ```
+
+2. **ground truth for Accuracy@10** (one-time exact top-10; streams the doc
+   embeddings, does not load the HNSW index):
+   ```bash
+   python compute_groundtruth.py <model> --dataset msmarco-on-cast   # --method stream (default)
+   ```
+
+3. **plain-HNSW baseline** (the comparison) — sweep efSearch 10..200:
+   ```bash
+   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+       --mode baseline --sweep --out baseline_sweep.csv
+   ```
+
+4. **QLR sweep** (`th × k' × ef × PCA`; EP/s_max built once and reused):
+   ```bash
+   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+       --sweep --log-limit 100000 --out qlr_sweep.csv
+   ```
+
+Each sweep writes a CSV (and prints a markdown table). Compare `baseline_sweep.csv`
+vs `qlr_sweep.csv`: QLR should reach about the **same Accuracy@10 as the baseline**
+on the identical index. A quick single-config first run:
+
+```bash
+python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+    --log-limit 2000 --max-turns 50
+```
+
+### Real routed latency (FAISS `search_level_0`)
+
+The routed level-0 beam search runs two ways: the pure-Python loop (validates
+correctness) or FAISS' built-in `search_level_0` — the *same* seeded level-0
+search, but executed in compiled C++, so it gives **real latency** with identical
+top-k. FAISS exposes the seeded entry points directly (`search_type=2`), so no
+custom C++ kernel is needed. Select the backend per run:
+
+```bash
+# whole run uses the FAISS backend -> routed_ms_per_q is real C++ latency
+python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+    --sweep --level0-backend faiss --out qlr_sweep.csv
+
+# OR run BOTH and put them side by side in the CSV (verify before trusting)
+python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+    --sweep --compare-backends --log-limit 2000 --max-turns 200
+```
+
+`--compare-backends` adds three columns: `routed_ms_faiss_per_q` (FAISS, real)
+next to `routed_ms_per_q` (Python), `speedup_routed` (their ratio), and
+`topk_match` — `1.0` means both backends return identical results, so the speedup
+is honest. Validate on a small `--log-limit`/`--max-turns` first; the speedup only
+shows on the full 38.6M index (on a tiny index the Python marshaling overhead
+dominates). The **IVF** path already runs in FAISS C++ via `search_preassigned`,
+so this backend swap applies only to the HNSW/QLR path.
+
+Notes:
+- The pure-Python routed latency (default `--level0-backend python`) is **not
+  real** — `avg_visited` (nodes scanned) is the implementation-independent
+  efficiency proxy, unaffected by mmap or thread count. For real routed latency use
+  `--level0-backend faiss` / `--compare-backends` (above); for a clean latency run
+  match `combine_base_top_hnsw.py` (no mmap, single-thread:
+  `OMP_NUM_THREADS=1 ... --threads 1`).
+- snowflake `th` is cosine (default 0.5); dragon is raw dot product, so its `th`
+  is calibrated from the data when unset.
+
 ## Interactive Demo (Streamlit)
 
 A small Streamlit app that runs conversational retrieval over a compact subset
