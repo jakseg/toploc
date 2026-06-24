@@ -12,20 +12,29 @@ standard HNSW document index. Algorithm 1, per query:
     run a level-0 beam search on the document index seeded from C.
 
 The seeded beam search reuses the TopLoc-HNSW level-0 kernel (FAISS exposes no
-API to seed HNSW entry points). Metrics via ir_measures (nDCG@3/10, RR@10);
-latency is measured separately, split into routed vs fallback queries.
+API to seed HNSW entry points). Metrics via ir_measures (nDCG@3/10, RR@10) plus
+Accuracy@10 vs exhaustive search (the paper's headline metric — needs a ground
+truth from compute_groundtruth.py). Latency is split into routed vs fallback.
 
-Status: rough logic build. The real historical query log is not wired up yet
-(see build_query_log); --log-source self reuses the eval queries so the whole
-pipeline runs end-to-end for sanity checks.
+Modes:
+  --mode qlr (default)   route every query through I_Q (Algorithm 1).
+  --mode baseline        plain HNSW, no routing — the apples-to-apples comparison.
+  --sweep                build EP/s_max (and I_Q per PCA dim) once, then sweep the
+                         paper grid: th, k', ef-search, PCA on/off -> CSV + table.
+  --pca-dim N            reduce the I_Q query vectors to N dims (paper dim/4).
+
+dragon vs snowflake: dragon is raw dot-product (not L2-normalised — like the
+paper's Contriever), so its th is on the dot-product scale and is calibrated from
+the data when unset; snowflake is cosine with th in [0.3, 0.7].
 
 Run examples:
-    python -u toploc2_hnsw_pure_python.py snowflake
-    TH=0.5 EF_DEFAULT=100 EF_MIN=10 K_EP=10 python -u toploc2_hnsw_pure_python.py dragon --max-turns 50
-    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --max-turns 20
-    # QLR on the real msmarco log/dev/qrels, searching the CAST2019 index as I_D
-    # (it already contains the msmarco passages); cap the log for a quick run:
-    python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast --log-limit 50000
+    python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast
+    # plain-HNSW baseline curve (sweep ef-search):
+    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+        --mode baseline --sweep
+    # full QLR sweep (th x k' x ef x PCA), capped log for a quick run:
+    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+        --sweep --log-limit 100000
 """
 
 import argparse
@@ -225,18 +234,19 @@ def load_qrels(path, pid_prefix=""):
     return qrels
 
 
-def turn_sort_key(turn_key):
-    """Sort keys like '31_1', '31_2', ... in conversation order."""
-    numbers = re.findall(r"\d+", turn_key)
-    return tuple(int(x) for x in numbers) if numbers else (10**9,)
-
-
-def load_parquet_embeddings(emb_dir):
-    """Load all *.parquet shards in emb_dir → (ids, (N,d) float32, L2-normalised).
+def load_parquet_embeddings(emb_dir, normalize=True):
+    """Load all *.parquet shards in emb_dir → (ids, (N,d) float32).
 
     Used for the msmarco query-embedding dirs (dev_query = test, train_query =
     Q_L). Each shard has an `id` (string) and `embedding` (list<float>) column;
     the shards are concatenated in filename order.
+
+    normalize: L2-normalise the vectors (cosine scale). True for snowflake
+    (arctic-embed is trained for cosine). MUST be False for dragon — dragon-plus
+    is trained for raw dot product, and the dragon document index is built
+    un-normalised (see create_index.py: `normalize_vecs = model_name != "dragon"`).
+    Normalising dragon here would put s / s_max / I_Q on a different scale than
+    the dragon I_D, breaking the th comparison.
     """
     files = sorted(glob.glob(os.path.join(emb_dir, "*.parquet")))
     if not files:
@@ -252,7 +262,8 @@ def load_parquet_embeddings(emb_dir):
         except Exception:
             mats.append(np.array(t.column("embedding").to_pylist(), dtype="float32"))
     emb = np.ascontiguousarray(np.vstack(mats), dtype="float32")
-    faiss.normalize_L2(emb)
+    if normalize:
+        faiss.normalize_L2(emb)
     return ids, emb
 
 
@@ -427,27 +438,47 @@ def adaptive_ef_search(s, s_max, th, ef_default, ef_min):
 
 
 def route(q, iq, ep_table, index_d, graph, s_max,
-          k=10, k_prime=10, th=0.5, ef_default=100, ef_min=10):
+          k=10, k_prime=10, th=0.5, ef_default=100, ef_min=10,
+          pca=None, log_emb_full=None):
     """Route one query (Alg. 1). Returns (scores, indices, visited, routed, s);
     visited is None on the fallback path (native FAISS gives no count).
 
     ef_default is the upper bound of the adaptive ef' and the efSearch used on
     the fallback path; set it to the HNSW baseline operating point you compare
     against (the efSearch sweep includes 512).
-    """
-    q = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
 
-    # 1-2. Closest historical queries. I_Q is inner-product on normalised
-    #      vectors, so the returned score IS the cosine similarity s.
-    sims, log_idx = iq.search(q, k_prime)
-    s = float(sims[0, 0])
+    PCA (optional optimisation, paper §"Practical Considerations"): when `pca` is
+    given, I_Q lives in the reduced space, so the incoming query is projected
+    (and L2-normalised) before the I_Q candidate search. But the routing
+    similarity `s` is then RECOMPUTED in the full-dimensional native space
+    (against the matched log vector in `log_emb_full`) so it stays on the same
+    scale as `th` and `s_max` — the PCA-space score is not. The seeded beam
+    search always runs on the full-dim document index with the full-dim query.
+    """
+    q_full = np.ascontiguousarray(q, dtype="float32").reshape(1, -1)
+
+    # 1-2. Closest historical queries via I_Q.
+    if pca is not None:
+        q_iq = pca_apply(pca, q_full)
+        faiss.normalize_L2(q_iq)
+    else:
+        # No PCA: I_Q is inner-product on the native query vectors, so the
+        # returned score IS s directly (cosine for snowflake, raw dot for dragon).
+        q_iq = q_full
+    sims, log_idx = iq.search(q_iq, k_prime)
     matched = [int(i) for i in log_idx[0] if i >= 0]
+
+    if pca is not None and matched:
+        # Recompute s in the full-dim native space so it is comparable to th/s_max.
+        s = float(np.dot(q_full[0], log_emb_full[matched[0]]))
+    else:
+        s = float(sims[0, 0])
 
     # 3-4. Not similar enough -> plain HNSW search on the document index.
     if not matched or s < th:
         old_ef = index_d.hnsw.efSearch
         index_d.hnsw.efSearch = ef_default
-        f_scores, f_idx = index_d.search(q, k)
+        f_scores, f_idx = index_d.search(q_full, k)
         index_d.hnsw.efSearch = old_ef
         return f_scores[0], f_idx[0], None, False, s
 
@@ -458,7 +489,7 @@ def route(q, iq, ep_table, index_d, graph, s_max,
     # 6-9 / 10. Adaptive beam width, then seeded level-0 search from C.
     ef = max(adaptive_ef_search(s, s_max, th, ef_default, ef_min), k)
     scores, idx, visited = toploc_hnsw_level0_search(
-        index_d, graph, q, entry_points=C, k=k, ef_search=ef
+        index_d, graph, q_full, entry_points=C, k=k, ef_search=ef
     )
     return scores[0], idx[0], visited, True, s
 
@@ -506,21 +537,210 @@ def add_to_run(run, turn_key, scores_row, indices_row, id_map):
             run[turn_key][pid] = float(score)
 
 
+# ================= PCA ON I_Q (optional) =================
+def pca_apply(pca, x):
+    """Project x with a trained faiss.PCAMatrix (handles the apply/apply_py rename)."""
+    x = np.ascontiguousarray(x, dtype="float32")
+    try:
+        return pca.apply(x)
+    except AttributeError:
+        return pca.apply_py(x)
+
+
+def build_pca(log_emb_full, pca_dim):
+    """Fit a PCA projection (dim -> pca_dim) on the query log Q_L (paper: dim/4)."""
+    d = log_emb_full.shape[1]
+    pca = faiss.PCAMatrix(d, pca_dim)
+    pca.train(np.ascontiguousarray(log_emb_full, dtype="float32"))
+    return pca
+
+
+def build_iq_for_pca(log_emb_full, pca):
+    """Build I_Q in the PCA-reduced space (projected + L2-normalised log vectors).
+    I_Q here only does coarse 'have I seen a similar query?' matching; the routing
+    similarity s is recomputed full-dim in route()."""
+    log_proj = pca_apply(pca, log_emb_full)
+    faiss.normalize_L2(log_proj)
+    return build_query_log_index(log_proj)
+
+
+# ================= GROUND TRUTH / ACCURACY@10 =================
+def groundtruth_path(cache_dir, model_name, dataset, k):
+    """Where compute_groundtruth.py writes the exact top-k for the dev queries."""
+    return os.path.join(cache_dir, f"groundtruth_dev_top{k}_{model_name}_{dataset}.json")
+
+
+def load_groundtruth(path):
+    """Load exact top-k pids per dev-query id (dict key -> [pid, ...]); None if absent.
+    Produced by compute_groundtruth.py in the same MARCO_<n> pid space as the run."""
+    if not os.path.exists(path):
+        return None
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def accuracy_at_k(run, gt, eval_keys, k):
+    """Paper metric: mean fraction of the true top-k retrieved (vs exhaustive GT).
+    Returns nan if no ground truth is available."""
+    if not gt:
+        return float("nan")
+    accs = []
+    for key in eval_keys:
+        true = gt.get(key)
+        if not true:
+            continue
+        true_set = set(true[:k])
+        got = set(run.get(key, {}).keys())
+        accs.append(len(got & true_set) / float(k))
+    return float(np.mean(accs)) if accs else float("nan")
+
+
+def compute_metrics(run, filtered_qrels, gt, eval_keys, k):
+    """nDCG@3, nDCG@k, RR@k (qrels-based relevance) + Accuracy@k (vs exhaustive)."""
+    measures = [nDCG @ 3, nDCG @ k, RR @ k]
+    res = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
+    return {
+        "NDCG@3": float(res[nDCG @ 3]),
+        f"NDCG@{k}": float(res[nDCG @ k]),
+        f"MRR@{k}": float(res[RR @ k]),
+        f"Accuracy@{k}": accuracy_at_k(run, gt, eval_keys, k),
+    }
+
+
+# ================= RUN BUILDERS =================
+def build_run_baseline(index, query_matrix, eval_keys, id_map, k, ef_search):
+    """Plain HNSW search (no routing) at a given efSearch — the apples-to-apples
+    baseline the paper compares QLR against. Returns (run, total_ms)."""
+    old_ef = index.hnsw.efSearch
+    index.hnsw.efSearch = ef_search
+    t0 = time.perf_counter()
+    scores, idxs = index.search(np.ascontiguousarray(query_matrix, dtype="float32"), k)
+    total_ms = (time.perf_counter() - t0) * 1000
+    index.hnsw.efSearch = old_ef
+    run = defaultdict(dict)
+    for row, key in enumerate(eval_keys):
+        add_to_run(run, key, scores[row], idxs[row], id_map)
+    return run, total_ms
+
+
+def build_run_qlr(index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                  k, k_prime, th, ef_default, ef_min, pca=None, log_emb_full=None):
+    """Route every eval query (Alg. 1) and assemble the run dict, timing routed vs
+    fallback. Returns (run, route_flags, sims, visited_counts, routed_ms, fallback_ms)."""
+    run = defaultdict(dict)
+    route_flags, sims, visited_counts = [], [], []
+    routed_ms = fallback_ms = 0.0
+    for row, key in enumerate(eval_keys):
+        t0 = time.perf_counter()
+        scores_row, idx_row, visited, routed, s = route(
+            query_matrix[row:row + 1], iq, ep_table, index, graph, s_max,
+            k=k, k_prime=k_prime, th=th, ef_default=ef_default, ef_min=ef_min,
+            pca=pca, log_emb_full=log_emb_full,
+        )
+        dt = (time.perf_counter() - t0) * 1000
+        add_to_run(run, key, scores_row, idx_row, id_map)
+        route_flags.append(routed)
+        sims.append(s)
+        if routed:
+            routed_ms += dt
+        else:
+            fallback_ms += dt
+        if visited is not None:
+            visited_counts.append(visited)
+    return run, route_flags, sims, visited_counts, routed_ms, fallback_ms
+
+
+def routing_similarities(query_matrix, iq, k_prime, pca=None, log_emb_full=None):
+    """Top-1 I_Q similarity s for every eval query (full-dim recompute under PCA).
+    Used to calibrate a data-driven th on the dragon (raw dot-product) scale."""
+    s_vals = []
+    for row in range(query_matrix.shape[0]):
+        q_full = np.ascontiguousarray(query_matrix[row:row + 1], dtype="float32")
+        if pca is not None:
+            q_iq = pca_apply(pca, q_full)
+            faiss.normalize_L2(q_iq)
+        else:
+            q_iq = q_full
+        sims, log_idx = iq.search(q_iq, k_prime)
+        if pca is not None and log_idx[0, 0] >= 0:
+            s_vals.append(float(np.dot(q_full[0], log_emb_full[int(log_idx[0, 0])])))
+        else:
+            s_vals.append(float(sims[0, 0]))
+    return np.asarray(s_vals, dtype="float64")
+
+
+# ================= SWEEP OUTPUT =================
+SWEEP_COLUMNS = [
+    "model", "dataset", "mode", "th", "k_prime", "ef", "pca",
+    "route_rate", "NDCG@3", "NDCG@10", "MRR@10", "Accuracy@10",
+    "avg_visited", "routed_ms_per_q", "fallback_ms_per_q",
+]
+
+
+def write_sweep_results(rows, out_path):
+    """Write the sweep rows to CSV and print a compact markdown table."""
+    import csv
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SWEEP_COLUMNS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r.get(c, "") for c in SWEEP_COLUMNS})
+    print(f"\nWrote {len(rows)} rows -> {out_path}", flush=True)
+
+    def fmt(v):
+        if isinstance(v, float):
+            return f"{v:.4f}" if not np.isnan(v) else "nan"
+        return str(v)
+
+    print("\n| " + " | ".join(SWEEP_COLUMNS) + " |")
+    print("|" + "|".join(["---"] * len(SWEEP_COLUMNS)) + "|")
+    for r in rows:
+        print("| " + " | ".join(fmt(r.get(c, "")) for c in SWEEP_COLUMNS) + " |")
+
+
 # ================= MAIN (QLR STEPS 4b–4d) =================
+def _parse_float_list(s):
+    return [float(x) for x in s.split(",") if x.strip() != ""]
+
+
+def _parse_int_list(s):
+    return [int(x) for x in s.split(",") if x.strip() != ""]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model", choices=["snowflake", "dragon"], nargs="?", default="snowflake")
     parser.add_argument("--k", type=int, default=int(os.environ.get("K", 10)))
     parser.add_argument("--k-prime", type=int, default=int(os.environ.get("K_PRIME", 10)),
                         help="k': log queries retrieved from I_Q per incoming query")
-    parser.add_argument("--th", type=float, default=float(os.environ.get("TH", 0.5)),
-                        help="similarity threshold; below it the query is not routed")
+    parser.add_argument("--th", type=float,
+                        default=(float(os.environ["TH"]) if os.environ.get("TH") else None),
+                        help="similarity threshold; below it the query is not routed. "
+                             "Unset -> 0.5 for snowflake (cosine); data-driven for dragon "
+                             "(raw dot-product scale, 25th pct of the routing similarities).")
     parser.add_argument("--ef-default", type=int, default=int(os.environ.get("EF_DEFAULT", 100)),
                         help="upper bound of adaptive ef' and the fallback efSearch")
     parser.add_argument("--ef-min", type=int, default=int(os.environ.get("EF_MIN", 10)),
                         help="lower bound of adaptive ef' (confident routes)")
     parser.add_argument("--k-ep", type=int, default=int(os.environ.get("K_EP", 10)),
                         help="entry points stored per log query in EP")
+    parser.add_argument("--pca-dim", type=int, default=int(os.environ.get("PCA_DIM", 0)),
+                        help="reduce I_Q query vectors to this dim via PCA (0=off; paper dim/4)")
+    parser.add_argument("--mode", choices=["qlr", "baseline"], default=os.environ.get("MODE", "qlr"),
+                        help="qlr (routed, default) or baseline (plain HNSW, the comparison)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="sweep hyperparameters, building EP/s_max (and I_Q per PCA) once")
+    parser.add_argument("--th-list", default=os.environ.get("TH_LIST", ""),
+                        help="comma th values for --sweep (default: paper grid / dragon pct grid)")
+    parser.add_argument("--kprime-list", default=os.environ.get("KPRIME_LIST", ""),
+                        help="comma k' values for --sweep (default: 10,20)")
+    parser.add_argument("--ef-list", default=os.environ.get("EF_LIST", ""),
+                        help="comma ef values for --sweep (ef_default / baseline efSearch; default 10..200)")
+    parser.add_argument("--pca-list", default=os.environ.get("PCA_LIST", ""),
+                        help="comma PCA dims for --sweep (default: 0,dim/4 to see with vs without)")
+    parser.add_argument("--out", default=os.environ.get("OUT", ""),
+                        help="results CSV path for --sweep (default: auto-named in cwd)")
     parser.add_argument("--log-source", default=os.environ.get("LOG_SOURCE", "self"),
                         help="where Q_L comes from for cast2019 (placeholder; 'self')")
     parser.add_argument("--dataset", default=os.environ.get("DATASET", "cast2019"),
@@ -538,6 +758,11 @@ def main():
 
     model_name = args.model
     dataset = args.dataset
+    # dragon-plus is trained for raw dot product (its document index is built
+    # un-normalised, see create_index.py); snowflake (arctic-embed) is cosine.
+    # Keep the query log / dev queries on the model's native scale so s, s_max and
+    # th are mutually consistent.
+    normalize = model_name != "dragon"
     # msmarco-on-cast searches the CAST2019 index (which already contains every
     # msmarco passage as MARCO_<n>, plus the CAR passages) using the msmarco
     # log/dev/qrels. Both msmarco modes share the parquet query loaders and the
@@ -595,7 +820,7 @@ def main():
         # dev queries: precomputed embeddings in parquet shards, keyed by query id.
         dev_dir = MSMARCO_DEV_QUERY_DIRS[model_name]
         print(f"\nLoading msmarco dev-query embeddings from {dev_dir}...", flush=True)
-        q_ids, q_emb = load_parquet_embeddings(dev_dir)
+        q_ids, q_emb = load_parquet_embeddings(dev_dir, normalize=normalize)
         id2row = {qid: i for i, qid in enumerate(q_ids)}
         eval_keys = [qid for qid in q_ids if qid in filtered_qrels]
         if args.max_turns:
@@ -630,66 +855,162 @@ def main():
 
     k = args.k
 
-    # ================= 4b. BUILD QLR (I_Q, EP, s_max) =================
+    # ---- ground truth for Accuracy@k (exhaustive top-k from compute_groundtruth.py) ----
+    gt_path = groundtruth_path(cache_dir, model_name, dataset, k)
+    gt = load_groundtruth(gt_path)
+    if gt is not None:
+        n_gt = sum(1 for key in eval_keys if gt.get(key))
+        print(f"Ground truth for Accuracy@{k}: {n_gt:,}/{N:,} eval queries "
+              f"({os.path.basename(gt_path)})", flush=True)
+    else:
+        print(f"No ground truth at {gt_path} -> Accuracy@{k} will be nan "
+              f"(run compute_groundtruth.py to enable it)", flush=True)
+
+    def make_row(mode, th, k_prime, ef, pca_dim, metrics, route_rate, avg_visited,
+                 routed_ms, fallback_ms, routed_n, fallback_n):
+        return {
+            "model": model_name, "dataset": dataset, "mode": mode,
+            "th": "" if th is None else round(float(th), 4),
+            "k_prime": "" if k_prime is None else k_prime,
+            "ef": ef, "pca": pca_dim, "route_rate": route_rate,
+            "NDCG@3": metrics.get("NDCG@3", float("nan")),
+            "NDCG@10": metrics.get(f"NDCG@{k}", float("nan")),
+            "MRR@10": metrics.get(f"MRR@{k}", float("nan")),
+            "Accuracy@10": metrics.get(f"Accuracy@{k}", float("nan")),
+            "avg_visited": round(avg_visited, 1) if avg_visited == avg_visited else float("nan"),
+            "routed_ms_per_q": round(routed_ms / routed_n, 4) if routed_n else float("nan"),
+            "fallback_ms_per_q": round(fallback_ms / fallback_n, 4) if fallback_n else float("nan"),
+        }
+
+    out_path = args.out or os.path.join(
+        os.getcwd(), f"qlr_sweep_{args.mode}_{model_name}_{dataset}.csv")
+
+    # ================= BASELINE: plain HNSW (the apples-to-apples comparison) =================
+    if args.mode == "baseline":
+        ef_list = (_parse_int_list(args.ef_list) if args.ef_list else
+                   (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
+        print(f"\n[baseline] plain HNSW search (no routing), efSearch in {ef_list}", flush=True)
+        rows = []
+        for ef in ef_list:
+            run, total_ms = build_run_baseline(index, query_matrix, eval_keys, id_map, k, ef)
+            metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
+            row = make_row("baseline", None, None, ef, 0, metrics,
+                           route_rate=0.0, avg_visited=float("nan"),
+                           routed_ms=0.0, fallback_ms=total_ms, routed_n=0, fallback_n=N)
+            rows.append(row)
+            print(f"  ef={ef:4d}  NDCG@{k}={row['NDCG@10']:.4f}  MRR@{k}={row['MRR@10']:.4f}  "
+                  f"Acc@{k}={row['Accuracy@10']:.4f}  {total_ms / N:.3f} ms/q", flush=True)
+        if args.sweep:
+            write_sweep_results(rows, out_path)
+        print("\nNOTE: pure-Python; batch latency is indicative only. The metrics "
+              "(NDCG/MRR/Accuracy) are real and directly comparable to the QLR run.")
+        return
+
+    # ================= QLR: build EP/s_max once, then route =================
     # Q_L: msmarco uses the train-query split (the historical log); cast2019 uses
     # the placeholder (--log-source self reuses the eval queries).
     print("\nBuilding Query Log Router...", flush=True)
     if msmarco_queries:
-        # msmarco-on-cast uses the full ~808k log; plain msmarco uses the 367k
-        # train_query subset that sits next to the (separate) msmarco collection.
         log_dir = MSMARCO_FULL_LOG_DIRS[model_name] if on_cast else MSMARCO_TRAIN_QUERY_DIR
         print(f"Loading msmarco train-query log from {log_dir}...", flush=True)
-        _, log_emb = load_parquet_embeddings(log_dir)
+        _, log_emb = load_parquet_embeddings(log_dir, normalize=normalize)
     else:
         log_emb = build_query_log(query_matrix, source=args.log_source)
     if args.log_limit:
         log_emb = np.ascontiguousarray(log_emb[: args.log_limit], dtype="float32")
         print(f"  Q_L capped to {len(log_emb):,} (via --log-limit)", flush=True)
+
+    # EP + s_max depend only on k_ep (fixed) and the doc index — build them ONCE
+    # and reuse across the whole th/k'/ef/PCA sweep (the |Q_L| doc searches are
+    # the expensive part). I_Q is (re)built per distinct PCA dim below.
     t0 = time.perf_counter()
-    iq = build_query_log_index(log_emb)
     ep_table, s_max = build_lookup_table(index, log_emb, k_ep=args.k_ep)
     build_ms = (time.perf_counter() - t0) * 1000
-    print(
-        f"  Q_L size={len(log_emb):,} | I_Q dim={iq.d} | k_ep={args.k_ep} | "
-        f"s_max={s_max:.4f} | th={args.th} | ef'∈[{args.ef_min},{args.ef_default}] | "
-        f"built in {build_ms:.1f} ms",
-        flush=True,
-    )
+    print(f"  Q_L size={len(log_emb):,} | k_ep={args.k_ep} | s_max={s_max:.4f} | "
+          f"EP built in {build_ms:.1f} ms", flush=True)
 
-    # ================= 4c. BUILD RUN (correctness, untimed) =================
-    print("\nBuilding run dict with QLR routing (untimed)...", flush=True)
-    run = defaultdict(dict)
-    route_flags, sims, visited_counts = [], [], []
+    dim = log_emb.shape[1]
+    pca_list = (_parse_int_list(args.pca_list) if args.pca_list else
+                ([0, dim // 4] if args.sweep else [args.pca_dim]))
+    kprime_list = (_parse_int_list(args.kprime_list) if args.kprime_list else
+                   ([10, 20] if args.sweep else [args.k_prime]))
+    ef_list = (_parse_int_list(args.ef_list) if args.ef_list else
+               (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
 
-    for row, turn_key in enumerate(eval_keys):
-        scores_row, idx_row, visited, routed, s = route(
-            query_matrix[row : row + 1], iq, ep_table, index, graph, s_max,
-            k=k, k_prime=args.k_prime, th=args.th,
-            ef_default=args.ef_default, ef_min=args.ef_min,
-        )
-        add_to_run(run, turn_key, scores_row, idx_row, id_map)
-        route_flags.append(routed)
-        sims.append(s)
-        if visited is not None:
-            visited_counts.append(visited)
-        if (row + 1) % 50 == 0 or (row + 1) == N:
-            print(f"  routed {sum(route_flags)}/{row + 1}", flush=True)
+    rows = []
+    # carried out of the loop for the single-config detailed report below
+    iq = pca = sims = visited_counts = metrics = None
+    th_used = kprime_used = ef_used = None
+    for pca_dim in pca_list:
+        if pca_dim and pca_dim > 0:
+            print(f"\n[I_Q] PCA {dim} -> {pca_dim}", flush=True)
+            pca = build_pca(log_emb, pca_dim)
+            iq = build_iq_for_pca(log_emb, pca)
+        else:
+            pca = None
+            iq = build_query_log_index(log_emb)
 
-    measures = [nDCG @ 3, nDCG @ k, RR @ k]
-    results = ir_measures.calc_aggregate(measures, dict(filtered_qrels), dict(run))
+        # Resolve th. dragon is on the raw dot-product scale, where 0.5 is
+        # meaningless, so calibrate from the actual routing-similarity distribution.
+        need_s = (model_name == "dragon" and
+                  (args.th is None or (args.sweep and not args.th_list)))
+        s_vals = routing_similarities(query_matrix, iq, args.k_prime, pca, log_emb) if need_s else None
+        if s_vals is not None:
+            print(f"  routing similarities s: min={s_vals.min():.4f} "
+                  f"p25={np.percentile(s_vals, 25):.4f} median={np.median(s_vals):.4f} "
+                  f"max={s_vals.max():.4f}", flush=True)
 
-    # ================= 4d. TIMING: PER-QUERY SWEEP =================
+        if args.sweep:
+            th_list = (_parse_float_list(args.th_list) if args.th_list else
+                       ([round(float(np.percentile(s_vals, p)), 4) for p in (10, 25, 40, 55, 70)]
+                        if model_name == "dragon" else [0.3, 0.4, 0.5, 0.6, 0.7]))
+        else:
+            th_resolved = (args.th if args.th is not None else
+                           (float(np.percentile(s_vals, 25)) if model_name == "dragon" else 0.5))
+            th_list = [th_resolved]
+
+        for th in th_list:
+            for k_prime in kprime_list:
+                for ef in ef_list:
+                    (run, route_flags, sims, visited_counts,
+                     routed_ms, fallback_ms) = build_run_qlr(
+                        index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                        k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
+                        pca=pca, log_emb_full=log_emb,
+                    )
+                    metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
+                    routed_n = int(sum(route_flags))
+                    fallback_n = N - routed_n
+                    avg_visited = float(np.mean(visited_counts)) if visited_counts else float("nan")
+                    rows.append(make_row("qlr", th, k_prime, ef, pca_dim, metrics,
+                                         route_rate=routed_n / N, avg_visited=avg_visited,
+                                         routed_ms=routed_ms, fallback_ms=fallback_ms,
+                                         routed_n=routed_n, fallback_n=fallback_n))
+                    th_used, kprime_used, ef_used = th, k_prime, ef
+                    print(f"  pca={pca_dim:>4} th={th:<8} k'={k_prime} ef={ef:<4} | "
+                          f"route={routed_n / N:5.1%} NDCG@{k}={rows[-1]['NDCG@10']:.4f} "
+                          f"MRR@{k}={rows[-1]['MRR@10']:.4f} Acc@{k}={rows[-1]['Accuracy@10']:.4f} "
+                          f"visited={avg_visited:.0f}", flush=True)
+
+    if args.sweep:
+        write_sweep_results(rows, out_path)
+        print("\nNOTE: pure-Python routed search; latency is indicative only and "
+              "needs the C++ kernel to be real. NDCG/MRR/Accuracy are real numbers.")
+        return
+
+    # ================= single-config detailed latency (warmup + timed sweeps) =================
+    th, k_prime, ef_default = th_used, kprime_used, ef_used
+
     def timed_sweep():
         """One full pass over all eval queries; split routed vs fallback time."""
         routed_ms, fallback_ms = 0.0, 0.0
         routed_cnt, fallback_cnt = 0, 0
         for row in range(N):
-            q = query_matrix[row : row + 1]
             t0 = time.perf_counter()
             _, _, _, routed, _ = route(
-                q, iq, ep_table, index, graph, s_max,
-                k=k, k_prime=args.k_prime, th=args.th,
-                ef_default=args.ef_default, ef_min=args.ef_min,
+                query_matrix[row:row + 1], iq, ep_table, index, graph, s_max,
+                k=k, k_prime=k_prime, th=th, ef_default=ef_default, ef_min=args.ef_min,
+                pca=pca, log_emb_full=log_emb,
             )
             dt = (time.perf_counter() - t0) * 1000
             if routed:
@@ -700,13 +1021,10 @@ def main():
                 fallback_cnt += 1
         return routed_ms, fallback_ms, routed_cnt, fallback_cnt
 
-    print(
-        f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed per-query sweeps...",
-        flush=True,
-    )
+    print(f"\nRunning {BATCH_WARMUP_RUNS} warmup + {BATCH_TIMED_RUNS} timed per-query sweeps...",
+          flush=True)
     for _ in range(BATCH_WARMUP_RUNS):
         timed_sweep()
-
     routed_times, fallback_times = [], []
     routed_n = fallback_n = 0
     for run_i in range(BATCH_TIMED_RUNS):
@@ -715,48 +1033,42 @@ def main():
         fallback_times.append(f_ms)
         r_pq = r_ms / routed_n if routed_n else float("nan")
         f_pq = f_ms / fallback_n if fallback_n else float("nan")
-        print(
-            f"  run {run_i + 1}: routed total={r_ms:7.2f} ms (per-query={r_pq:.3f}) | "
-            f"fallback total={f_ms:7.2f} ms (per-query={f_pq:.3f})",
-            flush=True,
-        )
+        print(f"  run {run_i + 1}: routed total={r_ms:7.2f} ms (per-query={r_pq:.3f}) | "
+              f"fallback total={f_ms:7.2f} ms (per-query={f_pq:.3f})", flush=True)
 
-    # ================= RESULTS =================
     r_min, r_med, r_mean = latency_stats(routed_times)
     f_min, f_med, f_mean = latency_stats(fallback_times)
     overall_times = [r + f for r, f in zip(routed_times, fallback_times)]
     o_min, o_med, o_mean = latency_stats(overall_times)
 
     print("\n" + "=" * 70)
-    print(f"QLR PURE PYTHON RESULTS ({model_name})")
+    print(f"QLR PURE PYTHON RESULTS ({model_name} [{dataset}])")
     print("=" * 70)
     print(f"Turns evaluated: {N}  ({routed_n} routed, {fallback_n} fallback)")
-    print(f"Route rate:      {sum(route_flags) / N:.1%}  (s>=th)")
-    print(f"Avg similarity:  {np.mean(sims):.4f}  (s_max={s_max:.4f}, th={args.th})")
-    print(f"NDCG@3:  {results[nDCG @ 3]:.4f}")
-    print(f"NDCG@10: {results[nDCG @ k]:.4f}")
-    print(f"MRR@10:  {results[RR @ k]:.4f}")
+    print(f"Route rate:      {routed_n / N:.1%}  (s>=th)")
+    print(f"Avg similarity:  {np.mean(sims):.4f}  (s_max={s_max:.4f}, th={th:.4f})")
+    print(f"NDCG@3:  {metrics['NDCG@3']:.4f}")
+    print(f"NDCG@{k}: {metrics[f'NDCG@{k}']:.4f}")
+    print(f"MRR@{k}:  {metrics[f'MRR@{k}']:.4f}")
+    print(f"Accuracy@{k}: {metrics[f'Accuracy@{k}']:.4f}   (vs exhaustive; nan if no ground truth)")
     print()
-    print(
-        f"Latency, summed over queries (min / median / mean over "
-        f"{BATCH_TIMED_RUNS} sweeps):"
-    )
+    print(f"Latency, summed over queries (min / median / mean over {BATCH_TIMED_RUNS} sweeps):")
     print(f"  routed   total:     {r_min:8.2f}  /  {r_med:8.2f}  /  {r_mean:8.2f}  ms")
     print(f"  routed   per query: {per_query_line((r_min, r_med, r_mean), routed_n)}")
     print(f"  fallback total:     {f_min:8.2f}  /  {f_med:8.2f}  /  {f_mean:8.2f}  ms")
     print(f"  fallback per query: {per_query_line((f_min, f_med, f_mean), fallback_n)}")
     print(f"  overall  total:     {o_min:8.2f}  /  {o_med:8.2f}  /  {o_mean:8.2f}  ms")
-    print(
-        f"  overall  per query: {per_query_line((o_min, o_med, o_mean), N)}"
-        "   <- compare to paper Time"
-    )
+    print(f"  overall  per query: {per_query_line((o_min, o_med, o_mean), N)}   <- compare to paper Time")
     print()
-    print(f"th={args.th}  k'={args.k_prime}  k_ep={args.k_ep}  ef'∈[{args.ef_min},{args.ef_default}]")
+    pca_dim = pca_list[0]
+    print(f"th={th:.4f}  k'={k_prime}  k_ep={args.k_ep}  ef'∈[{args.ef_min},{ef_default}]  pca={pca_dim}")
     if visited_counts:
         print(f"Avg visited nodes (routed): {np.mean(visited_counts):.1f}")
+    if args.out:
+        write_sweep_results(rows, out_path)
     print("=" * 70)
-    print("NOTE: routed search uses the pure-Python level-0 beam search and the")
-    print("Q_L placeholder; real latency/numbers need the C++ kernel + a real log.")
+    print("NOTE: routed search uses the pure-Python level-0 beam search; real")
+    print("latency needs the C++ kernel. NDCG/MRR/Accuracy are real numbers.")
 
 
 if __name__ == "__main__":
