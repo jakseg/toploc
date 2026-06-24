@@ -359,6 +359,46 @@ def toploc_hnsw_level0_search(index, graph, q_emb, entry_points, k=10, ef_search
     return scores, indices, len(visited)
 
 
+# ================= LEVEL-0 SEARCH VIA FAISS (real C++ latency) =================
+def faiss_level0_search(index, graph, q_emb, entry_points, k=10, ef_search=64):
+    """Seeded level-0 HNSW beam search via FAISS' built-in `search_level_0`.
+
+    Drop-in replacement for `toploc_hnsw_level0_search` (same signature + return
+    shape), but the beam search runs inside FAISS' compiled C++ instead of the
+    pure-Python loop -> REAL latency. `graph` is unused (kept for parity).
+
+    Recipe (verified identical top-k vs the Python beam): `search_type=2` enqueues
+    all entry points (= seed the beam from C); the seed distances are NEGATED inner
+    products because FAISS HNSW is internally "smaller = better". Assumes
+    METRIC_INNER_PRODUCT (every index in this repo). Returns (scores, indices,
+    visited) with visited=None — FAISS exposes no visited count.
+    """
+    q = np.ascontiguousarray(q_emb, dtype="float32").reshape(1, -1)
+    C = np.asarray(entry_points, dtype="int64")
+    C = np.ascontiguousarray(C[C >= 0].astype("int32"))
+    nprobe = int(C.shape[0])
+    if nprobe == 0:
+        return (np.full((1, k), -np.inf, "float32"),
+                np.full((1, k), -1, "int64"), None)
+    seed_vecs = reconstruct_batch_safe(index, C.astype("int64"))
+    nearest_d = np.ascontiguousarray((-(seed_vecs @ q[0])).astype("float32"))
+    D = np.empty((1, k), dtype="float32")
+    I = np.empty((1, k), dtype="int64")
+    old_ef = index.hnsw.efSearch
+    index.hnsw.efSearch = int(ef_search)
+    try:
+        args = (1, faiss.swig_ptr(q), k,
+                faiss.swig_ptr(C), faiss.swig_ptr(nearest_d),
+                faiss.swig_ptr(D), faiss.swig_ptr(I), nprobe, 2)
+        try:
+            index.search_level_0(*args)
+        except TypeError:          # some builds want the params arg explicitly
+            index.search_level_0(*args, None)
+    finally:
+        index.hnsw.efSearch = old_ef
+    return D, I, None
+
+
 # ================= QLR STEP 1 — QUERY LOG INDEX (I_Q) =================
 def build_query_log_index(log_emb, m=32, ef_construction=500, ef_search=64):
     """Build I_Q, the query-log index: an HNSW graph over the historical query
@@ -439,7 +479,7 @@ def adaptive_ef_search(s, s_max, th, ef_default, ef_min):
 
 def route(q, iq, ep_table, index_d, graph, s_max,
           k=10, k_prime=10, th=0.5, ef_default=100, ef_min=10,
-          pca=None, log_emb_full=None):
+          pca=None, log_emb_full=None, level0_backend="python"):
     """Route one query (Alg. 1). Returns (scores, indices, visited, routed, s);
     visited is None on the fallback path (native FAISS gives no count).
 
@@ -486,9 +526,12 @@ def route(q, iq, ep_table, index_d, graph, s_max,
     C = np.unique(ep_table[matched].ravel())
     C = C[C >= 0]
 
-    # 6-9 / 10. Adaptive beam width, then seeded level-0 search from C.
+    # 6-9 / 10. Adaptive beam width, then seeded level-0 search from C. The beam
+    # search backend is swappable: the pure-Python loop (validates correctness) or
+    # FAISS' built-in search_level_0 (real C++ latency, identical top-k).
     ef = max(adaptive_ef_search(s, s_max, th, ef_default, ef_min), k)
-    scores, idx, visited = toploc_hnsw_level0_search(
+    level0_fn = faiss_level0_search if level0_backend == "faiss" else toploc_hnsw_level0_search
+    scores, idx, visited = level0_fn(
         index_d, graph, q_full, entry_points=C, k=k, ef_search=ef
     )
     return scores[0], idx[0], visited, True, s
@@ -625,9 +668,11 @@ def build_run_baseline(index, query_matrix, eval_keys, id_map, k, ef_search):
 
 
 def build_run_qlr(index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
-                  k, k_prime, th, ef_default, ef_min, pca=None, log_emb_full=None):
+                  k, k_prime, th, ef_default, ef_min, pca=None, log_emb_full=None,
+                  level0_backend="python"):
     """Route every eval query (Alg. 1) and assemble the run dict, timing routed vs
-    fallback. Returns (run, route_flags, sims, visited_counts, routed_ms, fallback_ms)."""
+    fallback. Returns (run, route_flags, sims, visited_counts, routed_ms, fallback_ms).
+    level0_backend selects the routed beam search engine ('python' or 'faiss')."""
     run = defaultdict(dict)
     route_flags, sims, visited_counts = [], [], []
     routed_ms = fallback_ms = 0.0
@@ -636,7 +681,7 @@ def build_run_qlr(index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s
         scores_row, idx_row, visited, routed, s = route(
             query_matrix[row:row + 1], iq, ep_table, index, graph, s_max,
             k=k, k_prime=k_prime, th=th, ef_default=ef_default, ef_min=ef_min,
-            pca=pca, log_emb_full=log_emb_full,
+            pca=pca, log_emb_full=log_emb_full, level0_backend=level0_backend,
         )
         dt = (time.perf_counter() - t0) * 1000
         add_to_run(run, key, scores_row, idx_row, id_map)
@@ -649,6 +694,21 @@ def build_run_qlr(index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s
         if visited is not None:
             visited_counts.append(visited)
     return run, route_flags, sims, visited_counts, routed_ms, fallback_ms
+
+
+def topk_match_rate(run_a, run_b, keys, k):
+    """Mean |top-k(a) ∩ top-k(b)| / k over `keys` (1.0 = the two backends return
+    identical result sets). Used to confirm the FAISS backend matches the Python
+    beam search before trusting its latency."""
+    if not keys:
+        return float("nan")
+    fracs = []
+    for key in keys:
+        a = set(sorted(run_a.get(key, {}), key=lambda p: -run_a[key][p])[:k])
+        b = set(sorted(run_b.get(key, {}), key=lambda p: -run_b[key][p])[:k])
+        if a or b:
+            fracs.append(len(a & b) / max(k, 1))
+    return float(np.mean(fracs)) if fracs else float("nan")
 
 
 def routing_similarities(query_matrix, iq, k_prime, pca=None, log_emb_full=None):
@@ -675,6 +735,9 @@ SWEEP_COLUMNS = [
     "model", "dataset", "mode", "th", "k_prime", "ef", "pca",
     "route_rate", "NDCG@3", "NDCG@10", "MRR@10", "Accuracy@10",
     "avg_visited", "routed_ms_per_q", "fallback_ms_per_q",
+    # --compare-backends only: FAISS search_level_0 routed latency next to the
+    # pure-Python one (routed_ms_per_q), their ratio, and a correctness check.
+    "routed_ms_faiss_per_q", "speedup_routed", "topk_match",
 ]
 
 
@@ -727,6 +790,14 @@ def main():
                         help="entry points stored per log query in EP")
     parser.add_argument("--pca-dim", type=int, default=int(os.environ.get("PCA_DIM", 0)),
                         help="reduce I_Q query vectors to this dim via PCA (0=off; paper dim/4)")
+    parser.add_argument("--level0-backend", choices=["python", "faiss"],
+                        default=os.environ.get("LEVEL0_BACKEND", "python"),
+                        help="routed beam search engine: 'python' (validates "
+                             "correctness) or 'faiss' (search_level_0, real C++ latency)")
+    parser.add_argument("--compare-backends", action="store_true",
+                        default=os.environ.get("COMPARE_BACKENDS", "") == "1",
+                        help="in --sweep: also run the FAISS backend and add "
+                             "routed_ms_faiss_per_q / speedup_routed / topk_match columns")
     parser.add_argument("--mode", choices=["qlr", "baseline"], default=os.environ.get("MODE", "qlr"),
                         help="qlr (routed, default) or baseline (plain HNSW, the comparison)")
     parser.add_argument("--sweep", action="store_true",
@@ -972,30 +1043,61 @@ def main():
         for th in th_list:
             for k_prime in kprime_list:
                 for ef in ef_list:
+                    # In --compare-backends the primary run is forced to python so
+                    # it stays the correctness reference; faiss runs as the 2nd pass.
+                    backend = "python" if args.compare_backends else args.level0_backend
                     (run, route_flags, sims, visited_counts,
                      routed_ms, fallback_ms) = build_run_qlr(
                         index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
                         k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
-                        pca=pca, log_emb_full=log_emb,
+                        pca=pca, log_emb_full=log_emb, level0_backend=backend,
                     )
                     metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
                     routed_n = int(sum(route_flags))
                     fallback_n = N - routed_n
                     avg_visited = float(np.mean(visited_counts)) if visited_counts else float("nan")
-                    rows.append(make_row("qlr", th, k_prime, ef, pca_dim, metrics,
-                                         route_rate=routed_n / N, avg_visited=avg_visited,
-                                         routed_ms=routed_ms, fallback_ms=fallback_ms,
-                                         routed_n=routed_n, fallback_n=fallback_n))
+                    row = make_row("qlr", th, k_prime, ef, pca_dim, metrics,
+                                   route_rate=routed_n / N, avg_visited=avg_visited,
+                                   routed_ms=routed_ms, fallback_ms=fallback_ms,
+                                   routed_n=routed_n, fallback_n=fallback_n)
+                    extra = ""
+                    if args.compare_backends:
+                        (run_f, _f_flags, _f_sims, _f_vis,
+                         routed_ms_f, _f_fb) = build_run_qlr(
+                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                            k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
+                            pca=pca, log_emb_full=log_emb, level0_backend="faiss",
+                        )
+                        routed_keys = [eval_keys[i] for i, r in enumerate(route_flags) if r]
+                        row["routed_ms_faiss_per_q"] = (round(routed_ms_f / routed_n, 4)
+                                                        if routed_n else float("nan"))
+                        row["speedup_routed"] = (round(routed_ms / routed_ms_f, 2)
+                                                 if routed_ms_f else float("nan"))
+                        row["topk_match"] = round(topk_match_rate(run, run_f, routed_keys, k), 4)
+                        extra = (f" | faiss={row['routed_ms_faiss_per_q']:.3f}ms "
+                                 f"speedup={row['speedup_routed']:.2f}x "
+                                 f"match={row['topk_match']:.3f}")
+                    rows.append(row)
                     th_used, kprime_used, ef_used = th, k_prime, ef
                     print(f"  pca={pca_dim:>4} th={th:<8} k'={k_prime} ef={ef:<4} | "
                           f"route={routed_n / N:5.1%} NDCG@{k}={rows[-1]['NDCG@10']:.4f} "
                           f"MRR@{k}={rows[-1]['MRR@10']:.4f} Acc@{k}={rows[-1]['Accuracy@10']:.4f} "
-                          f"visited={avg_visited:.0f}", flush=True)
+                          f"visited={avg_visited:.0f}{extra}", flush=True)
 
     if args.sweep:
         write_sweep_results(rows, out_path)
-        print("\nNOTE: pure-Python routed search; latency is indicative only and "
-              "needs the C++ kernel to be real. NDCG/MRR/Accuracy are real numbers.")
+        if args.compare_backends:
+            print("\nNOTE: routed_ms_per_q = pure-Python beam (indicative); "
+                  "routed_ms_faiss_per_q = FAISS search_level_0 (REAL C++ latency). "
+                  "topk_match≈1.0 confirms identical results -> speedup_routed is the "
+                  "honest gain. NDCG/MRR/Accuracy are real numbers.")
+        elif args.level0_backend == "faiss":
+            print("\nNOTE: routed search via FAISS search_level_0 -> routed_ms_per_q "
+                  "is REAL C++ latency. NDCG/MRR/Accuracy are real numbers.")
+        else:
+            print("\nNOTE: pure-Python routed search; routed latency is indicative "
+                  "only (use --level0-backend faiss / --compare-backends for real "
+                  "C++ latency). NDCG/MRR/Accuracy are real numbers.")
         return
 
     # ================= single-config detailed latency (warmup + timed sweeps) =================
@@ -1010,7 +1112,7 @@ def main():
             _, _, _, routed, _ = route(
                 query_matrix[row:row + 1], iq, ep_table, index, graph, s_max,
                 k=k, k_prime=k_prime, th=th, ef_default=ef_default, ef_min=args.ef_min,
-                pca=pca, log_emb_full=log_emb,
+                pca=pca, log_emb_full=log_emb, level0_backend=args.level0_backend,
             )
             dt = (time.perf_counter() - t0) * 1000
             if routed:

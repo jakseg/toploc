@@ -84,7 +84,7 @@ paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
 
 ```bash
 conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
-python test_qlr_pipeline.py       # synthetic, runs in seconds -> 12/12 passed
+python test_qlr_pipeline.py       # synthetic, runs in seconds -> 14/14 passed
 ```
 
 ### Run order (on the server)
@@ -144,12 +144,39 @@ python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
     --log-limit 2000 --max-turns 50
 ```
 
+### Real routed latency (FAISS `search_level_0`)
+
+The routed level-0 beam search runs two ways: the pure-Python loop (validates
+correctness) or FAISS' built-in `search_level_0` — the *same* seeded level-0
+search, but executed in compiled C++, so it gives **real latency** with identical
+top-k. FAISS exposes the seeded entry points directly (`search_type=2`), so no
+custom C++ kernel is needed. Select the backend per run:
+
+```bash
+# whole run uses the FAISS backend -> routed_ms_per_q is real C++ latency
+python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+    --sweep --level0-backend faiss --out qlr_sweep.csv
+
+# OR run BOTH and put them side by side in the CSV (verify before trusting)
+python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+    --sweep --compare-backends --log-limit 2000 --max-turns 200
+```
+
+`--compare-backends` adds three columns: `routed_ms_faiss_per_q` (FAISS, real)
+next to `routed_ms_per_q` (Python), `speedup_routed` (their ratio), and
+`topk_match` — `1.0` means both backends return identical results, so the speedup
+is honest. Validate on a small `--log-limit`/`--max-turns` first; the speedup only
+shows on the full 38.6M index (on a tiny index the Python marshaling overhead
+dominates). The **IVF** path already runs in FAISS C++ via `search_preassigned`,
+so this backend swap applies only to the HNSW/QLR path.
+
 Notes:
-- Pure-Python latency is **not real** — `avg_visited` (nodes scanned) is the
-  implementation-independent efficiency proxy, and it (like accuracy) is unaffected
-  by mmap or thread count. Reproducing the paper's latency speedup needs the C++
-  kernel; for that real-latency run, match `combine_base_top_hnsw.py` exactly (no
-  mmap, single-thread: `OMP_NUM_THREADS=1 ... --threads 1`).
+- The pure-Python routed latency (default `--level0-backend python`) is **not
+  real** — `avg_visited` (nodes scanned) is the implementation-independent
+  efficiency proxy, unaffected by mmap or thread count. For real routed latency use
+  `--level0-backend faiss` / `--compare-backends` (above); for a clean latency run
+  match `combine_base_top_hnsw.py` (no mmap, single-thread:
+  `OMP_NUM_THREADS=1 ... --threads 1`).
 - snowflake `th` is cosine (default 0.5); dragon is raw dot product, so its `th`
   is calibrated from the data when unset.
 

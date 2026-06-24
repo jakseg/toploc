@@ -127,6 +127,38 @@ def test_level0_search_seeded_runs():
     assert 0 < visited <= 150
 
 
+def test_faiss_level0_matches_python():
+    """FAISS search_level_0 backend == the Python beam (same seeded level-0 search).
+    Skips gracefully if the installed faiss build does not expose search_level_0."""
+    probe = faiss.IndexHNSWFlat(4, 8, faiss.METRIC_INNER_PRODUCT)
+    if not hasattr(probe, "search_level_0"):
+        print("  (skipped: this faiss build has no search_level_0)")
+        return
+    index, graph, docs, _ = make_doc_index(n=120, d=12, seed=12)
+    n = docs.shape[0]
+    q = docs[5] + 0.01 * np.random.default_rng(0).standard_normal(docs.shape[1]).astype("float32")
+    bf = brute_force_topk(docs, q, 10)
+    # Seed every node + ef_search >= n -> both backends must return the EXACT top-k.
+    sp, ip_, _ = qlr.toploc_hnsw_level0_search(index, graph, q, entry_points=np.arange(n), k=10, ef_search=n)
+    sf, iff, vis = qlr.faiss_level0_search(index, graph, q, entry_points=np.arange(n), k=10, ef_search=n)
+    assert [i for i in ip_[0].tolist() if i >= 0] == bf
+    assert [i for i in iff[0].tolist() if i >= 0] == bf, (iff[0].tolist(), bf)
+    assert vis is None                                  # FAISS gives no visited count
+    assert np.allclose(sf[0], sp[0], atol=1e-4)         # same inner-product scores
+    # empty seed set -> graceful empty result (matches the route() C-can-be-empty path)
+    se, ie, _ = qlr.faiss_level0_search(index, graph, q, entry_points=np.array([], dtype=int), k=10)
+    assert (ie[0] < 0).all()
+
+
+def test_topk_match_rate():
+    run_a = {"q1": {"a": 3.0, "b": 2.0, "c": 1.0}}
+    run_b = {"q1": {"a": 3.0, "b": 2.0, "z": 0.5}}
+    # top-3 {a,b,c} vs {a,b,z} -> intersection {a,b} = 2/3
+    assert abs(qlr.topk_match_rate(run_a, run_b, ["q1"], 3) - (2 / 3)) < 1e-9
+    assert qlr.topk_match_rate(run_a, run_a, ["q1"], 3) == 1.0       # identical
+    assert np.isnan(qlr.topk_match_rate(run_a, run_b, [], 3))        # no keys
+
+
 def test_route_fallback_and_routed():
     index, graph, docs, id_map = make_doc_index(n=200, d=16, seed=5)
     log = docs[:30].copy()                # log queries == some docs -> high routability
@@ -238,6 +270,8 @@ def main():
         ("build_iq_and_lookup", lambda: test_build_iq_and_lookup()),
         ("level0_search_exact", lambda: test_level0_search_exact()),
         ("level0_search_seeded_runs", lambda: test_level0_search_seeded_runs()),
+        ("faiss_level0_matches_python", lambda: test_faiss_level0_matches_python()),
+        ("topk_match_rate", lambda: test_topk_match_rate()),
         ("route_fallback_and_routed", lambda: test_route_fallback_and_routed()),
         ("route_with_pca", lambda: test_route_with_pca()),
         ("accuracy_at_k", lambda: test_accuracy_at_k()),
