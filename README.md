@@ -68,6 +68,83 @@ Quick sanity check with a single query:
 python test_ivf_pipeline.py <model>
 ```
 
+## QLR (Query Log Router — toploc2)
+
+Reimplementation of "HNSW Graph Meets Query Logs": a lightweight router in front
+of a standard HNSW document index. It runs on `msmarco-on-cast` — the CAST2019
+HNSW index is the document index `I_D` (it already contains every msmarco passage
+as `MARCO_<n>`), with the msmarco train split as the query log `Q_L` and the
+msmarco dev queries + `qrels.dev.small.tsv` as the test set.
+
+Driver: `toploc2_hnsw_pure_python.py` (pure Python, no C++). Two metrics are
+reported: **Accuracy@10** (fraction of the *exhaustive* top-10 retrieved — the
+paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
+
+### 0. Local sanity check (no server needed)
+
+```bash
+conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
+python test_qlr_pipeline.py       # synthetic, runs in seconds -> 12/12 passed
+```
+
+### Run order (on the server)
+
+All commands use `--dataset msmarco-on-cast`. The snowflake CAST index (~157 GiB)
+is larger than the free RAM on the shared node, so **always set `MMAP=1`** (a
+non-mmap load OOMs). `compute_groundtruth.py` is the exception — it streams the
+document embeddings and never loads the HNSW index.
+
+**One-shot wrapper** (runs steps 1–4 below and tees logs to
+`results_<model>_<dataset>_<ts>/`):
+
+```bash
+bash run_qlr_experiments.sh snowflake               # snowflake (data validated)
+bash run_qlr_experiments.sh dragon                  # encodes dev embeddings + smoke test first
+LOG_LIMIT=0 bash run_qlr_experiments.sh snowflake   # full ~808k log (default caps |Q_L| at 100k)
+```
+
+Or the individual steps, in order:
+
+1. **(dragon only)** encode the dev queries and validate the data:
+   ```bash
+   python encode_msmarco_dev_dragon.py
+   python smoke_test_msmarco_on_cast.py dragon       # expect ~100% qrels coverage, READY
+   ```
+
+2. **ground truth for Accuracy@10** (one-time exact top-10; streams the doc
+   embeddings, does not load the HNSW index):
+   ```bash
+   python compute_groundtruth.py <model> --dataset msmarco-on-cast   # --method stream (default)
+   ```
+
+3. **plain-HNSW baseline** (the comparison) — sweep efSearch 10..200:
+   ```bash
+   MMAP=1 python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+       --mode baseline --sweep --out baseline_sweep.csv
+   ```
+
+4. **QLR sweep** (`th × k' × ef × PCA`; EP/s_max built once and reused):
+   ```bash
+   MMAP=1 python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+       --sweep --log-limit 100000 --out qlr_sweep.csv
+   ```
+
+Each sweep writes a CSV (and prints a markdown table). Compare `baseline_sweep.csv`
+vs `qlr_sweep.csv`: QLR should reach about the **same Accuracy@10 as the baseline**
+on the identical index. A quick single-config first run:
+
+```bash
+MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+    --log-limit 2000 --max-turns 50
+```
+
+Notes:
+- Pure-Python latency is **not real** — `avg_visited` (nodes scanned) is the
+  implementation-independent efficiency proxy. Reproducing the paper's latency
+  speedup needs the C++ kernel.
+- snowflake `th` is cosine (default 0.5); dragon is raw dot product, so its `th`
+  is calibrated from the data when unset.
+
 ## Interactive Demo (Streamlit)
 
 A small Streamlit app that runs conversational retrieval over a compact subset
