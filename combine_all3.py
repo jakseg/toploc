@@ -623,11 +623,18 @@ print(
 
 # ================= WRITE CSV (sweep mode) =================
 if SWEEP:
-    out_csv = f"results3_{model_name}_{index_type}.csv"
+    os.makedirs("results/raw/ivf", exist_ok=True)
+
+    out_csv = (
+        f"results/raw/ivf/"
+        f"ivf_{model_name}_H{H}_A{ALPHA}_mmap{int(USE_MMAP)}.csv"
+    )
+
     with open(out_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
     print(f"\nCSV written: {out_csv}  ({len(rows)} rows)")
     print(
         "All three methods: follow-up + overall ms-per-query, speedups, "

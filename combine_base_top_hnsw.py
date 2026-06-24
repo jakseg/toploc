@@ -718,13 +718,20 @@ def main():
     print("Times shown in the table are FOLLOW-UP per-query latency in ms.")
     print("Overall per-query latency is written to CSV.")
 
-    if args.sweep_values:
-        out_csv = f"results_{args.model}_hnsw_toploc_combined.csv"
-        with open(out_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"\nCSV written: {out_csv} ({len(rows)} rows)")
+if args.sweep_values:
+    os.makedirs("results/raw/hnsw", exist_ok=True)
+
+    out_csv = (
+        f"results/raw/hnsw/"
+        f"hnsw_{args.model}_up{args.up}_ep{args.entry_points}_mmap{int(USE_MMAP)}.csv"
+    )
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nCSV written: {out_csv} ({len(rows)} rows)")
 
     if args.backend == "python":
         print("\nNOTE: --backend python is correctness/debug only. Use --backend cpp for real latency.")
