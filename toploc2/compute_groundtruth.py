@@ -41,9 +41,9 @@ import toploc2_hnsw_pure_python as qlr  # path constants + loaders (import-safe)
 # searches the CAST2019 collection (its HNSW index is I_D), so it reuses cast2019.
 DOC_EMB_BASE = {
     "cast2019": os.environ.get(
-        "CAST_EMB_BASE", "/home/toploc2/Datasets/conversational/CAST2019"),
+        "CAST_EMB_BASE", "/home/toploc1/Datasets/conversational/CAST2019"),
     "msmarco": os.environ.get(
-        "MSMARCO_EMB_BASE", "/home/toploc2/Datasets/conversational/msmarco"),
+        "MSMARCO_EMB_BASE", "/home/toploc1/Datasets/conversational/msmarco"),
 }
 DOC_EMB_SUBDIR = {
     "cast2019": {"snowflake": "snowflake_embeddings", "dragon": "dragon_embeddings"},
