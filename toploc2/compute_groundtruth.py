@@ -103,35 +103,40 @@ def topk_stream(dev_emb, model_name, dataset, k, tile):
     print(f"Streaming {len(shards)} shards from {emb_dir} (dim={dim}, normalize={normalize}, "
           f"tile={tile})...", flush=True)
 
+    # Carry GLOBAL INTEGER doc indices (not pid strings) through the merge so the
+    # hot loop stays fully vectorised (object arrays would be ~100x slower); map
+    # the final n*k indices back to pids once at the end.
     best_scores = np.full((n, k), -np.inf, dtype="float32")
-    best_pid = np.full((n, k), "", dtype=object)
+    best_gidx = np.full((n, k), -1, dtype="int64")
+    all_ids = []
     t0 = time.time()
-    seen = 0
+    offset = 0
     for si, pf in enumerate(shards):
         ids, embs = read_parquet_shard(pf, dim)
         if normalize:
             faiss.normalize_L2(embs)
-        pids = np.asarray(ids, dtype=object)
-        for start in range(0, embs.shape[0], tile):
+        all_ids.extend(ids)
+        m = embs.shape[0]
+        for start in range(0, m, tile):
             block = embs[start:start + tile]
-            scores = dev_emb @ block.T                      # (n, t)
+            bt = block.shape[0]
+            scores = dev_emb @ block.T                      # (n, bt)
+            gidx = (offset + start) + np.arange(bt, dtype="int64")
             cat_s = np.concatenate([best_scores, scores], axis=1)
-            cat_p = np.concatenate(
-                [best_pid, np.broadcast_to(pids[start:start + block.shape[0]], (n, block.shape[0]))],
-                axis=1,
-            )
+            cat_i = np.concatenate([best_gidx, np.broadcast_to(gidx, (n, bt))], axis=1)
             part = np.argpartition(-cat_s, kth=k - 1, axis=1)[:, :k]
             best_scores = np.take_along_axis(cat_s, part, axis=1)
-            best_pid = np.take_along_axis(cat_p, part, axis=1)
-        seen += embs.shape[0]
+            best_gidx = np.take_along_axis(cat_i, part, axis=1)
+        offset += m
         if (si + 1) % 10 == 0 or (si + 1) == len(shards):
-            print(f"  shard {si + 1}/{len(shards)}  docs={seen:,}  "
+            print(f"  shard {si + 1}/{len(shards)}  docs={offset:,}  "
                   f"{time.time() - t0:.0f}s", flush=True)
 
-    # sort each row's k by descending score (argpartition is unordered)
+    # sort each row's k by descending score, then map global idx -> pid
     order = np.argsort(-best_scores, axis=1)
-    best_pid = np.take_along_axis(best_pid, order, axis=1)
-    return best_pid
+    best_gidx = np.take_along_axis(best_gidx, order, axis=1)
+    all_ids = np.asarray(all_ids, dtype=object)
+    return all_ids[best_gidx]
 
 
 def topk_exact_index(dev_emb, model_name, dataset, k):

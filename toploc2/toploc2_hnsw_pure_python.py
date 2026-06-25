@@ -742,14 +742,17 @@ SWEEP_COLUMNS = [
 
 
 def write_sweep_results(rows, out_path):
-    """Write the sweep rows to CSV and print a compact markdown table."""
+    """Write the sweep rows to CSV (same csv.DictWriter convention as
+    combine_all3 / combine_base_top_hnsw; creates the parent dir if needed)
+    and print a compact markdown table."""
     import csv
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=SWEEP_COLUMNS)
         w.writeheader()
         for r in rows:
             w.writerow({c: r.get(c, "") for c in SWEEP_COLUMNS})
-    print(f"\nWrote {len(rows)} rows -> {out_path}", flush=True)
+    print(f"\nCSV written: {out_path} ({len(rows)} rows)", flush=True)
 
     def fmt(v):
         if isinstance(v, float):
@@ -944,18 +947,21 @@ def main():
             "model": model_name, "dataset": dataset, "mode": mode,
             "th": "" if th is None else round(float(th), 4),
             "k_prime": "" if k_prime is None else k_prime,
-            "ef": ef, "pca": pca_dim, "route_rate": route_rate,
-            "NDCG@3": metrics.get("NDCG@3", float("nan")),
-            "NDCG@10": metrics.get(f"NDCG@{k}", float("nan")),
-            "MRR@10": metrics.get(f"MRR@{k}", float("nan")),
-            "Accuracy@10": metrics.get(f"Accuracy@{k}", float("nan")),
-            "avg_visited": round(avg_visited, 1) if avg_visited == avg_visited else float("nan"),
+            "ef": ef, "pca": pca_dim, "route_rate": round(route_rate, 4),
+            "NDCG@3": round(metrics.get("NDCG@3", float("nan")), 4),
+            "NDCG@10": round(metrics.get(f"NDCG@{k}", float("nan")), 4),
+            "MRR@10": round(metrics.get(f"MRR@{k}", float("nan")), 4),
+            "Accuracy@10": round(metrics.get(f"Accuracy@{k}", float("nan")), 4),
+            "avg_visited": round(avg_visited, 2) if avg_visited == avg_visited else float("nan"),
             "routed_ms_per_q": round(routed_ms / routed_n, 4) if routed_n else float("nan"),
             "fallback_ms_per_q": round(fallback_ms / fallback_n, 4) if fallback_n else float("nan"),
         }
 
+    # Default output mirrors combine_all3 / combine_base_top_hnsw: results/raw/<kind>/
+    # with the run params + mmap flag in the name. --out still overrides.
     out_path = args.out or os.path.join(
-        os.getcwd(), f"qlr_sweep_{args.mode}_{model_name}_{dataset}.csv")
+        "results", "raw", "qlr",
+        f"qlr_{model_name}_{dataset}_{args.mode}_log{args.log_limit}_mmap{int(USE_MMAP)}.csv")
 
     # ================= BASELINE: plain HNSW (the apples-to-apples comparison) =================
     # --mode both runs baseline AND qlr in this same process, so the giant index is

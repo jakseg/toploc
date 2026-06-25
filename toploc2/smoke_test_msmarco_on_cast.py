@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
-from toploc2_hnsw_pure_python import (
+from toploc2.toploc2_hnsw_pure_python import (
     CACHE_DIRS, MSMARCO_QRELS, MSMARCO_DEV_QUERY_DIRS, MSMARCO_FULL_LOG_DIRS,
     load_qrels,
 )
@@ -74,7 +74,22 @@ def main():
     else:
         dev_ids, dev_dim = parquet_ids_and_dim(dev_dir)
         eval_n = sum(1 for q in dev_ids if q in qrels)
-        print(f"[dev] {len(dev_ids):,} queries, dim {dev_dim} | {eval_n:,} have qrels -> EVAL SET\n")
+        print(f"[dev] {len(dev_ids):,} queries, dim {dev_dim} | {eval_n:,} have qrels -> EVAL SET")
+        # parity: a non-snowflake dev set must cover the SAME query ids as the
+        # snowflake one, so both encoders are scored on an identical eval set
+        # (encode_msmarco_dev_dragon.py builds it that way — verify it here).
+        if model != "snowflake":
+            sf_dir = MSMARCO_DEV_QUERY_DIRS.get("snowflake")
+            if sf_dir and glob.glob(os.path.join(sf_dir, "*.parquet")):
+                sf_ids, _ = parquet_ids_and_dim(sf_dir)
+                if set(dev_ids) == set(sf_ids):
+                    print(f"  parity vs snowflake dev set: IDENTICAL ({len(set(sf_ids)):,} ids)")
+                else:
+                    only_here = len(set(dev_ids) - set(sf_ids))
+                    only_sf = len(set(sf_ids) - set(dev_ids))
+                    print(f"  parity vs snowflake dev set: DIFFERS "
+                          f"(this-only={only_here:,}, snowflake-only={only_sf:,})")
+        print()
 
     # 4. train log (Q_L): shard count + first-shard dim (don't load the full log).
     log_dir = MSMARCO_FULL_LOG_DIRS[model]

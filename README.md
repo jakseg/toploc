@@ -15,8 +15,8 @@ pip install -r requirements.txt
 ### 1. Create Embeddings
 
 ```bash
-python create_embeddings_snowflake.py   # Snowflake Arctic Embed (1024-dim)
-python create_embeddings_dragon.py      # Dragon+ (768-dim)
+python create_embeddings/create_embeddings_snowflake.py   # Snowflake Arctic Embed (1024-dim)
+python create_embeddings/create_embeddings_dragon.py      # Dragon+ (768-dim)
 ```
 
 Outputs are saved to `data/snowflake/` and `data/dragon/` respectively.
@@ -223,7 +223,7 @@ demo uses a conda environment (`environment.yml`). A system C++ compiler is
 required for the build (macOS: `xcode-select --install`; Linux: `build-essential`).
 
 ```bash
-./build_demo.sh        # creates the 'toploc-demo' conda env and compiles toploc_search
+./demo/build_demo.sh   # creates the 'toploc-demo' conda env and compiles toploc_search
 ```
 
 This recreates the environment from `environment.yml` and builds
