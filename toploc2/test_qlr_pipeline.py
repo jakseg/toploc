@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import faiss
 
-import toploc2_hnsw_pure_python as qlr
+import toploc2.toploc2_hnsw_pure_python as qlr
 
 
 # ---------- tiny fixtures ----------

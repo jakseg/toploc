@@ -798,8 +798,9 @@ def main():
                         default=os.environ.get("COMPARE_BACKENDS", "") == "1",
                         help="in --sweep: also run the FAISS backend and add "
                              "routed_ms_faiss_per_q / speedup_routed / topk_match columns")
-    parser.add_argument("--mode", choices=["qlr", "baseline"], default=os.environ.get("MODE", "qlr"),
-                        help="qlr (routed, default) or baseline (plain HNSW, the comparison)")
+    parser.add_argument("--mode", choices=["qlr", "baseline", "both"], default=os.environ.get("MODE", "qlr"),
+                        help="qlr (routed, default), baseline (plain HNSW), or both "
+                             "(baseline + qlr in ONE process so the index loads once)")
     parser.add_argument("--sweep", action="store_true",
                         help="sweep hyperparameters, building EP/s_max (and I_Q per PCA) once")
     parser.add_argument("--th-list", default=os.environ.get("TH_LIST", ""),
@@ -957,25 +958,29 @@ def main():
         os.getcwd(), f"qlr_sweep_{args.mode}_{model_name}_{dataset}.csv")
 
     # ================= BASELINE: plain HNSW (the apples-to-apples comparison) =================
-    if args.mode == "baseline":
-        ef_list = (_parse_int_list(args.ef_list) if args.ef_list else
-                   (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
-        print(f"\n[baseline] plain HNSW search (no routing), efSearch in {ef_list}", flush=True)
-        rows = []
-        for ef in ef_list:
+    # --mode both runs baseline AND qlr in this same process, so the giant index is
+    # loaded only ONCE; the rows are merged into a single CSV at the end.
+    baseline_rows = []
+    if args.mode in ("baseline", "both"):
+        ef_list_b = (_parse_int_list(args.ef_list) if args.ef_list else
+                     (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
+        print(f"\n[baseline] plain HNSW search (no routing), efSearch in {ef_list_b}", flush=True)
+        for ef in ef_list_b:
             run, total_ms = build_run_baseline(index, query_matrix, eval_keys, id_map, k, ef)
             metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
             row = make_row("baseline", None, None, ef, 0, metrics,
                            route_rate=0.0, avg_visited=float("nan"),
                            routed_ms=0.0, fallback_ms=total_ms, routed_n=0, fallback_n=N)
-            rows.append(row)
+            baseline_rows.append(row)
             print(f"  ef={ef:4d}  NDCG@{k}={row['NDCG@10']:.4f}  MRR@{k}={row['MRR@10']:.4f}  "
                   f"Acc@{k}={row['Accuracy@10']:.4f}  {total_ms / N:.3f} ms/q", flush=True)
-        if args.sweep:
-            write_sweep_results(rows, out_path)
-        print("\nNOTE: pure-Python; batch latency is indicative only. The metrics "
-              "(NDCG/MRR/Accuracy) are real and directly comparable to the QLR run.")
-        return
+        if args.mode == "baseline":
+            if args.sweep:
+                write_sweep_results(baseline_rows, out_path)
+            print("\nNOTE: pure-Python; batch latency is indicative only. The metrics "
+                  "(NDCG/MRR/Accuracy) are real and directly comparable to the QLR run.")
+            return
+        # mode == "both": the index stays loaded — fall through to QLR, merge at the end.
 
     # ================= QLR: build EP/s_max once, then route =================
     # Q_L: msmarco uses the train-query split (the historical log); cast2019 uses
@@ -1085,7 +1090,7 @@ def main():
                           f"visited={avg_visited:.0f}{extra}", flush=True)
 
     if args.sweep:
-        write_sweep_results(rows, out_path)
+        write_sweep_results(baseline_rows + rows, out_path)
         if args.compare_backends:
             print("\nNOTE: routed_ms_per_q = pure-Python beam (indicative); "
                   "routed_ms_faiss_per_q = FAISS search_level_0 (REAL C++ latency). "
@@ -1167,7 +1172,7 @@ def main():
     if visited_counts:
         print(f"Avg visited nodes (routed): {np.mean(visited_counts):.1f}")
     if args.out:
-        write_sweep_results(rows, out_path)
+        write_sweep_results(baseline_rows + rows, out_path)
     print("=" * 70)
     print("NOTE: routed search uses the pure-Python level-0 beam search; real")
     print("latency needs the C++ kernel. NDCG/MRR/Accuracy are real numbers.")

@@ -2,7 +2,7 @@
 # Set up the demo environment and compile the real toploc_search C++ kernel.
 #
 # One-time setup on any machine (after installing Miniconda/Conda):
-#     ./build_demo.sh
+#     ./demo/build_demo.sh   # run from the repo root
 # Then run the demo:
 #     conda activate toploc-demo
 #     streamlit run demo/demo_app.py
@@ -15,7 +15,9 @@
 set -eo pipefail
 
 ENV_NAME=toploc-demo
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This script lives in demo/, so the repo root is one level up. environment.yml,
+# CMakeLists.txt and toploc_search.cpp all live at the repo root.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # 1. Create (or update) the conda environment from the recipe.
