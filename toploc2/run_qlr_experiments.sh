@@ -47,10 +47,14 @@ $PY -u compute_groundtruth.py "$MODEL" --dataset "$DATASET" --method stream \
 #    --mode both runs the plain-HNSW efSearch sweep AND the QLR sweep
 #    (th x k' x ef-search x PCA), writing both into one CSV (the 'mode' column
 #    separates them). EP/s_max are built once and reused across the QLR grid.
-echo "== 2/2 baseline + QLR sweep (single index load) =="
+#    --threads 1 is MANDATORY for paper-faithful latency (the paper searches
+#    single-threaded); latency_ms_per_q is then the amortized, comparable number.
+#    (GT above keeps many threads for its matmul — it doesn't touch the index.)
+echo "== 2/2 baseline + QLR sweep (single index load, threads=1 for faithful latency) =="
 $PY -u toploc2_hnsw_pure_python.py "$MODEL" --dataset "$DATASET" \
-  --mode both --sweep --log-limit "$LOG_LIMIT" --threads "${THREADS:-14}" \
+  --mode both --sweep --log-limit "$LOG_LIMIT" --threads 1 \
   --out "$OUT/sweep.csv" \
   2>&1 | tee "$OUT/sweep.log"
 
-echo "Done. In $OUT/sweep.csv compare mode=baseline vs mode=qlr (Accuracy@10 at matched cost)."
+echo "Done. In $OUT/sweep.csv compare mode=baseline vs mode=qlr at MATCHED Accuracy@10:"
+echo "  baseline latency_ms_per_q  vs  qlr latency_ms_per_q  ->  speedup (grows with the target)."

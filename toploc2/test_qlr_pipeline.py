@@ -150,6 +150,35 @@ def test_faiss_level0_matches_python():
     assert (ie[0] < 0).all()
 
 
+def test_faiss_level0_batch_matches_single():
+    """Batched seeded search (one search_level_0 over many queries, VisitedTable
+    amortized once) == looping the single-query faiss_level0_search. Validates the
+    paper-faithful latency path returns IDENTICAL results, incl. the duplicate
+    padding used for variable-length seed sets."""
+    probe = faiss.IndexHNSWFlat(4, 8, faiss.METRIC_INNER_PRODUCT)
+    if not hasattr(probe, "search_level_0"):
+        print("  (skipped: this faiss build has no search_level_0)")
+        return
+    index, graph, docs, _ = make_doc_index(n=130, d=12, seed=21)
+    queries = docs[[3, 17, 42, 88, 5]].copy()
+    seed_lists = [
+        np.array([3, 4, 5], dtype="int64"),
+        np.array([17], dtype="int64"),                       # padded up to the batch max
+        np.array([42, 7, 9, 11, 13, 15], dtype="int64"),     # the batch max (nprobe=6)
+        np.array([88, 0], dtype="int64"),
+        np.array([5, 6, 7, 8], dtype="int64"),
+    ]
+    ef = 32
+    ref_I = []
+    for q, c in zip(queries, seed_lists):
+        _, I1, _ = qlr.faiss_level0_search(index, graph, q, entry_points=c, k=10, ef_search=ef)
+        ref_I.append([i for i in I1[0].tolist() if i >= 0])
+    _, In = qlr.faiss_level0_search_batch(index, queries, seed_lists, ef_search=ef, k=10)
+    for r in range(len(queries)):
+        got = [i for i in In[r].tolist() if i >= 0]
+        assert got == ref_I[r], (r, got, ref_I[r])
+
+
 def test_topk_match_rate():
     run_a = {"q1": {"a": 3.0, "b": 2.0, "c": 1.0}}
     run_b = {"q1": {"a": 3.0, "b": 2.0, "z": 0.5}}
@@ -255,6 +284,37 @@ def test_build_run_baseline_and_qlr():
     assert set(mq) == {"NDCG@3", "NDCG@10", "MRR@10", "Accuracy@10"}
 
 
+def test_measure_qlr_latency_faithful():
+    """The paper-faithful batched measurement returns the SAME top-k as the
+    single-query build_run_qlr (faiss backend), plus a latency decomposition."""
+    probe = faiss.IndexHNSWFlat(4, 8, faiss.METRIC_INNER_PRODUCT)
+    if not hasattr(probe, "search_level_0"):
+        print("  (skipped: this faiss build has no search_level_0)")
+        return
+    index, graph, docs, id_map = make_doc_index(n=200, d=16, seed=9)
+    eval_keys = [f"q{i}" for i in range(24)]
+    query_matrix = docs[:24].copy()
+    log = docs[:60].copy()
+    iq = qlr.build_query_log_index(log)
+    ep, s_max = qlr.build_lookup_table(index, log, k_ep=10)
+    # th=-1 -> all routed (exercises the batched seeded path incl. ef' grouping);
+    # th=1.01 -> all fallback (exercises the batched plain-search path). Both must
+    # return the SAME top-k as the single-query build_run_qlr (faiss backend).
+    for th, tag in [(-1.0, "all-routed"), (1.01, "all-fallback")]:
+        run_ref, flags_ref, _, _, _, _ = qlr.build_run_qlr(
+            index, graph, query_matrix, eval_keys, id_map, iq, ep, s_max,
+            k=10, k_prime=10, th=th, ef_default=48, ef_min=10, level0_backend="faiss")
+        run_f, flags_f, sims_f, timing, routed_n = qlr.measure_qlr_latency_faithful(
+            index, query_matrix, eval_keys, id_map, iq, ep, s_max,
+            k=10, k_prime=10, th=th, ef_default=48, ef_min=10)
+        assert flags_f == flags_ref, (tag, flags_f, flags_ref)     # same routing decisions
+        assert routed_n == sum(flags_ref), tag
+        assert qlr.topk_match_rate(run_f, run_ref, eval_keys, 10) == 1.0, tag   # identical top-k
+        assert set(timing) == {"latency_ms_per_q", "qlr_route_ms_per_q",
+                               "qlr_seeded_ms_per_q", "qlr_fallback_ms_per_q"}
+        assert timing["latency_ms_per_q"] >= 0.0
+
+
 def test_parse_lists():
     assert qlr._parse_float_list("0.3,0.4,0.5") == [0.3, 0.4, 0.5]
     assert qlr._parse_int_list("10,20") == [10, 20]
@@ -271,12 +331,14 @@ def main():
         ("level0_search_exact", lambda: test_level0_search_exact()),
         ("level0_search_seeded_runs", lambda: test_level0_search_seeded_runs()),
         ("faiss_level0_matches_python", lambda: test_faiss_level0_matches_python()),
+        ("faiss_level0_batch_matches_single", lambda: test_faiss_level0_batch_matches_single()),
         ("topk_match_rate", lambda: test_topk_match_rate()),
         ("route_fallback_and_routed", lambda: test_route_fallback_and_routed()),
         ("route_with_pca", lambda: test_route_with_pca()),
         ("accuracy_at_k", lambda: test_accuracy_at_k()),
         ("compute_metrics_and_groundtruth", lambda: test_compute_metrics_and_groundtruth_roundtrip(tmp)),
         ("build_run_baseline_and_qlr", lambda: test_build_run_baseline_and_qlr()),
+        ("measure_qlr_latency_faithful", lambda: test_measure_qlr_latency_faithful()),
         ("parse_lists", lambda: test_parse_lists()),
     ]
     failed = 0
