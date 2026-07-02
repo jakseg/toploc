@@ -6,6 +6,7 @@ Baseline HNSW + TopLoc-HNSW in ONE script.
 
 Purpose
 -------
+This is the HNSW analogue of combine_base_top_ivf.py:
   * load the huge FAISS HNSW index once
   * load/encode all evaluation queries once
   * run baseline HNSW and TopLoc-HNSW under the same process/settings
@@ -37,6 +38,22 @@ Then run with PYTHONPATH pointing to the build directory:
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     python -u combine_base_top_hnsw.py snowflake hnsw --threads 1
 
+Examples
+--------
+Single efSearch, default EF_SEARCH env var or 64:
+    python -u combine_base_top_hnsw.py snowflake hnsw --threads 1
+
+Single efSearch explicitly:
+    python -u combine_base_top_hnsw.py snowflake hnsw --ef-search 128 --up 2 --threads 1
+
+Sweep:
+    python -u combine_base_top_hnsw.py snowflake hnsw --sweep --threads 1
+
+Custom sweep:
+    python -u combine_base_top_hnsw.py snowflake hnsw --sweep 16,32,64,128 --threads 1
+
+Debug small run:
+    python -u combine_base_top_hnsw.py snowflake hnsw --max-turns 20 --threads 1
 """
 
 from __future__ import annotations
@@ -58,9 +75,9 @@ from ir_measures import RR, nDCG
 
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
 )
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
@@ -629,6 +646,11 @@ def parse_args():
     parser.add_argument("index_type", choices=["hnsw"], nargs="?", default="hnsw")
     parser.add_argument("--ef-search", type=int, default=int(os.environ.get("EF_SEARCH", 64)))
     parser.add_argument("--up", type=int, default=int(os.environ.get("UP", 2)))
+    parser.add_argument(
+        "--up-values",
+        default=None,
+        help="Optional comma-list for TopLoc-HNSW up sweep, e.g. --up-values 2,4,8,16",
+    )
     parser.add_argument("--entry-points", type=int, default=int(os.environ.get("ENTRY_POINTS", 1)))
     parser.add_argument("--k", type=int, default=int(os.environ.get("K", 10)))
     parser.add_argument("--threads", type=int, default=int(os.environ.get("THREADS", 1)))
@@ -642,9 +664,15 @@ def parse_args():
         help="Sweep efSearch values. Optional comma-list, e.g. --sweep 16,32,64,128",
     )
     args = parser.parse_args()
+
     args.sweep_values = None
     if args.sweep is not None:
         args.sweep_values = [int(x.strip()) for x in args.sweep.split(",") if x.strip()]
+
+    args.up_values = None
+    if args.up_values is not None:
+        args.up_values = [int(x.strip()) for x in args.up_values.split(",") if x.strip()]
+
     return args
 
 
@@ -653,85 +681,128 @@ def main():
     args = parse_args()
     evaluator = HnswCombinedEvaluator(args)
 
+    # IMPORTANT:
+    # The index and query embeddings are loaded/created once above.
+    # These loops only run searches with different efSearch/up values.
     ef_values = args.sweep_values if args.sweep_values else [args.ef_search]
+    up_values = args.up_values if args.up_values else [args.up]
     rows = []
 
-    print("\n" + "=" * 118)
+    print("\n" + "=" * 130)
     header = (
-        f"{'ef':>6} | {'base ms':>9} {'topl ms':>9} {'speedup':>8} | "
-        f"{'b_NDCG3':>8} {'t_NDCG3':>8} | {'b_NDCG10':>9} {'t_NDCG10':>9} | "
-        f"{'b_MRR10':>8} {'t_MRR10':>8} | {'visited':>8}"
+        f"{'ef':>6} {'up':>5} | "
+        f"{'base ms':>9} {'topl ms':>9} {'speedup':>8} | "
+        f"{'b_NDCG3':>8} {'t_NDCG3':>8} | "
+        f"{'b_NDCG10':>9} {'t_NDCG10':>9} | "
+        f"{'b_MRR10':>8} {'t_MRR10':>8} | "
+        f"{'visited':>8}"
     )
     print(header)
-    print("-" * 118)
+    print("-" * 130)
 
+    # Baseline HNSW depends on efSearch, but not on up.
+    # Therefore we compute baseline once per efSearch and reuse it for all up values.
     for ef in ef_values:
         b_metrics, b_fu_pq, b_overall, b_first_n, b_followup_n = evaluator.eval_baseline(ef)
-        t_metrics, t_fu_pq, t_overall, t_first_n, t_followup_n, avg_visited = evaluator.eval_toploc(
-            ef, args.up, args.entry_points
-        )
-
-        speedup = b_fu_pq / t_fu_pq if np.isfinite(t_fu_pq) and t_fu_pq > 0 else float("nan")
         b_n3, b_n10, b_mrr = metric_values(b_metrics, args.k)
-        t_n3, t_n10, t_mrr = metric_values(t_metrics, args.k)
 
-        print(
-            f"{ef:>6} | {b_fu_pq:>9.3f} {t_fu_pq:>9.3f} {speedup:>7.2f}x | "
-            f"{b_n3:>8.4f} {t_n3:>8.4f} | "
-            f"{b_n10:>9.4f} {t_n10:>9.4f} | "
-            f"{b_mrr:>8.4f} {t_mrr:>8.4f} | {avg_visited:>8.1f}",
-            flush=True,
-        )
+        for up in up_values:
+            t_metrics, t_fu_pq, t_overall, t_first_n, t_followup_n, avg_visited = evaluator.eval_toploc(
+                ef, up, args.entry_points
+            )
 
-        rows.append(
-            {
-                "ef_search": ef,
-                "up": args.up,
-                "entry_points": args.entry_points,
-                "backend": args.backend,
-                "threads": args.threads,
-                "baseline_followup_ms_per_query": round(b_fu_pq, 4),
-                "toploc_followup_ms_per_query": round(t_fu_pq, 4),
-                "speedup_followup": round(speedup, 3),
-                "baseline_overall_ms_per_query": round(b_overall, 4),
-                "toploc_overall_ms_per_query": round(t_overall, 4),
-                "baseline_NDCG@3": round(b_n3, 4),
-                "toploc_NDCG@3": round(t_n3, 4),
-                "baseline_NDCG@10": round(b_n10, 4),
-                "toploc_NDCG@10": round(t_n10, 4),
-                "baseline_MRR@10": round(b_mrr, 4),
-                "toploc_MRR@10": round(t_mrr, 4),
-                "avg_visited_nodes_toploc": round(avg_visited, 2) if np.isfinite(avg_visited) else "",
-                "baseline_first_turns": b_first_n,
-                "baseline_followup_turns": b_followup_n,
-                "toploc_first_turns": t_first_n,
-                "toploc_followup_turns": t_followup_n,
-            }
-        )
+            speedup = (
+                b_fu_pq / t_fu_pq
+                if np.isfinite(t_fu_pq) and t_fu_pq > 0
+                else float("nan")
+            )
+            t_n3, t_n10, t_mrr = metric_values(t_metrics, args.k)
 
-    print("=" * 118)
+            print(
+                f"{ef:>6} {up:>5} | "
+                f"{b_fu_pq:>9.3f} {t_fu_pq:>9.3f} {speedup:>7.2f}x | "
+                f"{b_n3:>8.4f} {t_n3:>8.4f} | "
+                f"{b_n10:>9.4f} {t_n10:>9.4f} | "
+                f"{b_mrr:>8.4f} {t_mrr:>8.4f} | "
+                f"{avg_visited:>8.1f}",
+                flush=True,
+            )
+
+            rows.append(
+                {
+                    "model": args.model,
+                    "index": args.index_type,
+                    "method_group": "hnsw",
+                    "ef_search": ef,
+                    "up": up,
+                    "entry_points": args.entry_points,
+                    "backend": args.backend,
+                    "threads": args.threads,
+                    "mmap": int(USE_MMAP),
+
+                    "baseline_followup_ms_per_query": round(b_fu_pq, 4),
+                    "toploc_followup_ms_per_query": round(t_fu_pq, 4),
+                    "speedup_followup": round(speedup, 3),
+
+                    "baseline_overall_ms_per_query": round(b_overall, 4),
+                    "toploc_overall_ms_per_query": round(t_overall, 4),
+
+                    "baseline_NDCG@3": round(b_n3, 4),
+                    "toploc_NDCG@3": round(t_n3, 4),
+
+                    "baseline_NDCG@10": round(b_n10, 4),
+                    "toploc_NDCG@10": round(t_n10, 4),
+
+                    "baseline_MRR@10": round(b_mrr, 4),
+                    "toploc_MRR@10": round(t_mrr, 4),
+
+                    "avg_visited_nodes_toploc": (
+                        round(avg_visited, 2) if np.isfinite(avg_visited) else ""
+                    ),
+
+                    "baseline_first_turns": b_first_n,
+                    "baseline_followup_turns": b_followup_n,
+                    "toploc_first_turns": t_first_n,
+                    "toploc_followup_turns": t_followup_n,
+                }
+            )
+
+    print("=" * 130)
     print(
-        f"\nup={args.up} | entry_points={args.entry_points} | "
+        f"\nef_values={ef_values} | up_values={up_values} | "
+        f"entry_points={args.entry_points} | "
         f"warmup={BATCH_WARMUP_RUNS} timed={BATCH_TIMED_RUNS} | "
-        f"threads={args.threads} | backend={args.backend}"
+        f"threads={args.threads} | backend={args.backend} | mmap={int(USE_MMAP)}"
     )
     print("Times shown in the table are FOLLOW-UP per-query latency in ms.")
     print("Overall per-query latency is written to CSV.")
 
-if args.sweep_values:
-    os.makedirs("results/raw/hnsw", exist_ok=True)
+    # Write CSV when we are doing either efSearch sweep or up sweep.
+    if args.sweep_values or args.up_values:
+        os.makedirs("results/raw/hnsw", exist_ok=True)
 
-    out_csv = (
-        f"results/raw/hnsw/"
-        f"hnsw_{args.model}_up{args.up}_ep{args.entry_points}_mmap{int(USE_MMAP)}.csv"
-    )
+        ef_tag = (
+            f"ef{min(ef_values)}-{max(ef_values)}"
+            if len(ef_values) > 1
+            else f"ef{ef_values[0]}"
+        )
+        up_tag = (
+            f"up{min(up_values)}-{max(up_values)}"
+            if len(up_values) > 1
+            else f"up{up_values[0]}"
+        )
 
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+        out_csv = (
+            f"results/raw/hnsw/"
+            f"hnsw_{args.model}_{ef_tag}_{up_tag}_ep{args.entry_points}_mmap{int(USE_MMAP)}.csv"
+        )
 
-    print(f"\nCSV written: {out_csv} ({len(rows)} rows)")
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"\nCSV written: {out_csv} ({len(rows)} rows)")
 
     if args.backend == "python":
         print("\nNOTE: --backend python is correctness/debug only. Use --backend cpp for real latency.")
