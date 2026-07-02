@@ -21,20 +21,24 @@ For each conversation:
   3. Follow-up turns are searched with a custom level-0 beam search seeded from
      the privileged entry point(s).
 
-Important
----------
-Real latency needs the C++ pybind11 module `toploc_hnsw_search`.
-Build it first, for example:
+Latency backend (IMPORTANT)
+---------------------------
+The follow-up "seeded level-0 beam search" is TopLoc's speedup step. There are
+three backends:
 
-    mkdir -p build_hnsw_release
-    cd build_hnsw_release
-    cmake .. -DCMAKE_BUILD_TYPE=Release
-    make -j
-    cd ..
+  * faiss  (DEFAULT, real latency)  native FAISS `search_level_0` — the exact
+           same seeded level-0 beam, run inside FAISS' compiled C++ (SIMD distance
+           computer + flat VisitedTable). ALL follow-ups are searched in ONE call
+           so the VisitedTable(ntotal) scratch buffer is allocated once and
+           amortized. The baseline follow-ups are batched the same way, so the
+           comparison is the paper's single-thread "average query response time".
+           No C++ module to build — faiss already exposes this.
+  * cpp / python  hand-rolled beam kernels. Correctness/debug ONLY — they are slow
+           (per-node Python / naive C++ overhead) and will make TopLoc look SLOWER
+           than the baseline, which is a kernel artifact, not the algorithm.
 
-Then run with PYTHONPATH pointing to the build directory:
+Run (real latency, single thread):
 
-    PYTHONPATH=build_hnsw_release \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
     python -u combine_base_top_hnsw.py snowflake hnsw --threads 1
 
@@ -347,6 +351,75 @@ def python_level0_search_batch(index, graph, q_embs, entry_points, k: int, ef_se
     )
 
 
+def faiss_level0_search_batch(index, queries, entry_point_lists, ef_search: int, k: int = 10):
+    """Seeded TopLoc level-0 beam search via FAISS' native `search_level_0`, over
+    MANY queries in ONE call — the real-latency, paper-faithful backend.
+
+    This is the exact TopLoc follow-up operation (level-0 beam from cached q0 entry
+    points, skipping the hierarchy descent), but run inside FAISS' compiled C++
+    with its SIMD distance computer and flat VisitedTable instead of a Python/naive
+    kernel. `search_type=2` enqueues every entry point as a beam seed; FAISS HNSW is
+    internally "smaller = better", so seed distances are NEGATED inner products
+    (assumes METRIC_INNER_PRODUCT — every index in this repo). Top-k is IDENTICAL to
+    the Python beam (asserted in test_combine_hnsw_level0.py).
+
+    Batching is what makes it fast AND fair: FAISS allocates its VisitedTable(ntotal)
+    — ~ntotal bytes, the only per-call structure that scales with the 38.6M index —
+    ONCE for the whole batch. A single-query call re-allocates+zeros it every time
+    (~8-18 ms flat, ef-independent), which is a benchmark artifact, not TopLoc's
+    cost (see QLR latency notes). All follow-ups share the same ef-search, so they
+    fit in one call. Per-query seed sets have variable length; shorter ones are
+    padded with -1 (FAISS' "no entry" marker, skipped by the beam) so nprobe is
+    uniform WITHOUT polluting results with duplicate seeds.
+
+    queries: (m, d) float32. entry_point_lists: list of m int arrays (the cached
+    entry points per follow-up query). Returns (D, I) of shape (m, k); rows whose
+    entry set is empty are blanked.
+    """
+    m = len(entry_point_lists)
+    if m == 0:
+        return np.empty((0, k), "float32"), np.empty((0, k), "int64")
+    Q = np.ascontiguousarray(queries, dtype="float32").reshape(m, -1)
+    cleaned = [np.asarray(c, dtype="int64") for c in entry_point_lists]
+    cleaned = [c[c >= 0] for c in cleaned]
+    nprobe = max((len(c) for c in cleaned), default=0)
+    D = np.full((m, k), -np.inf, dtype="float32")
+    I = np.full((m, k), -1, dtype="int64")
+    if nprobe == 0:
+        return D, I
+    empty = [i for i, c in enumerate(cleaned) if len(c) == 0]
+    nearest = np.full((m, nprobe), -1, dtype="int32")  # -1 = padding, skipped by the beam
+    for i, c in enumerate(cleaned):
+        nearest[i, : len(c)] = c.astype("int32")
+    # Seed distances for the whole batch at once: negated inner products. Padded
+    # (-1) slots get +inf so they can never be selected even by a build that does
+    # not skip them.
+    recon = np.where(nearest.reshape(-1) < 0, 0, nearest.reshape(-1)).astype("int64")
+    vecs = reconstruct_batch_safe(index, recon).reshape(m, nprobe, -1)
+    nearest_d = (-(np.einsum("mpd,md->mp", vecs, Q))).astype("float32")
+    nearest_d[nearest < 0] = np.inf
+    nearest_d = np.ascontiguousarray(nearest_d)
+    nearest = np.ascontiguousarray(nearest)
+    old_ef = index.hnsw.efSearch
+    index.hnsw.efSearch = int(ef_search)
+    try:
+        args = (
+            m, faiss.swig_ptr(Q), k,
+            faiss.swig_ptr(nearest), faiss.swig_ptr(nearest_d),
+            faiss.swig_ptr(D), faiss.swig_ptr(I), nprobe, 2,
+        )
+        try:
+            index.search_level_0(*args)
+        except TypeError:  # some builds want the params arg explicitly
+            index.search_level_0(*args, None)
+    finally:
+        index.hnsw.efSearch = old_ef
+    for i in empty:
+        D[i] = -np.inf
+        I[i] = -1
+    return D, I
+
+
 # ================= UTILS =================
 def latency_stats(times_ms: Sequence[float]) -> Tuple[float, float, float]:
     if not times_ms:
@@ -520,19 +593,40 @@ class HnswCombinedEvaluator:
         first_n = len(conv_rows)
         followup_n = sum(max(0, len(rows) - 1) for rows in conv_rows)
 
+        # All follow-up rows across all conversations, flattened once.
+        all_fu_rows = [r for rows in conv_rows for r in rows[1:]]
+        all_fu_matrix = (
+            np.ascontiguousarray(self.query_matrix[all_fu_rows], dtype="float32")
+            if all_fu_rows
+            else None
+        )
+        first_rows = [rows[0] for rows in conv_rows]
+
         def sweep():
             first_ms = 0.0
             followup_ms = 0.0
-            for rows in conv_rows:
-                q0_row = rows[0]
+            # First turns: searched one at a time (q0 always runs alone in TopLoc too).
+            for q0_row in first_rows:
                 t0 = time.perf_counter()
                 self.index.search(self.query_matrix[q0_row : q0_row + 1], self.k)
                 first_ms += (time.perf_counter() - t0) * 1000
-                if len(rows) > 1:
-                    fu_rows = rows[1:]
+            # Follow-ups. With the faiss backend, ALL follow-ups go in ONE batched
+            # search so the plain-HNSW VisitedTable(ntotal) is amortized exactly the
+            # same way as TopLoc's batched search_level_0 — the fair, single-thread
+            # "average query latency" comparison. cpp/python keep the per-conversation
+            # batching of the older correctness-only path.
+            if all_fu_matrix is not None:
+                if self.args.backend == "faiss":
                     t0 = time.perf_counter()
-                    self.index.search(self.query_matrix[fu_rows], self.k)
+                    self.index.search(all_fu_matrix, self.k)
                     followup_ms += (time.perf_counter() - t0) * 1000
+                else:
+                    for rows in conv_rows:
+                        if len(rows) > 1:
+                            fu_rows = rows[1:]
+                            t0 = time.perf_counter()
+                            self.index.search(self.query_matrix[fu_rows], self.k)
+                            followup_ms += (time.perf_counter() - t0) * 1000
             return first_ms, followup_ms
 
         for _ in range(BATCH_WARMUP_RUNS):
@@ -553,12 +647,18 @@ class HnswCombinedEvaluator:
         k = self.k
         old_ef = self.index.hnsw.efSearch
 
+        use_faiss = self.args.backend == "faiss"
+
         # Build TopLoc run + cache structures for timing.
         run = defaultdict(dict)
         conv_q0_emb = {}
         conv_entry_points = {}
-        conv_fu_embs = {}
+        conv_fu_embs = {}       # per-conversation batches (cpp/python timing path)
         conv_fu_keys = {}
+        # Flat, globally-aligned follow-up arrays (faiss timing path).
+        fu_embs_flat: List[np.ndarray] = []
+        fu_keys_flat: List[str] = []
+        fu_eps_flat: List[np.ndarray] = []
         visited_counts = []
 
         for conv_i, (conv_id, valid_turns) in enumerate(self.conv_valid.items(), start=1):
@@ -583,13 +683,18 @@ class HnswCombinedEvaluator:
             followup_keys = valid_turns[1:]
             if followup_keys:
                 fu_embs = np.vstack([self.emb_lookup[t] for t in followup_keys]).astype("float32")
-                conv_fu_embs[conv_id] = fu_embs
                 conv_fu_keys[conv_id] = followup_keys
-
-                scores, indices, visited = self._toploc_search(fu_embs, eps, ef_search)
-                visited_counts.extend([int(x) for x in np.asarray(visited)])
-                for row, turn_key in enumerate(followup_keys):
-                    add_to_run(run, turn_key, scores[row], indices[row], self.id_map)
+                if use_faiss:
+                    for row, turn_key in enumerate(followup_keys):
+                        fu_embs_flat.append(fu_embs[row])
+                        fu_keys_flat.append(turn_key)
+                        fu_eps_flat.append(eps)
+                else:
+                    conv_fu_embs[conv_id] = fu_embs
+                    scores, indices, visited = self._toploc_search(fu_embs, eps, ef_search)
+                    visited_counts.extend([int(x) for x in np.asarray(visited)])
+                    for row, turn_key in enumerate(followup_keys):
+                        add_to_run(run, turn_key, scores[row], indices[row], self.id_map)
 
             if self.args.progress and (conv_i % 5 == 0 or conv_i == len(self.conv_valid)):
                 print(f"  TopLoc run build: conv {conv_i}/{len(self.conv_valid)}", flush=True)
@@ -597,6 +702,18 @@ class HnswCombinedEvaluator:
         self.index.hnsw.efSearch = old_ef
         first_n = len(conv_q0_emb)
         followup_n = sum(len(v) for v in conv_fu_keys.values())
+
+        # faiss backend: build the whole follow-up run in ONE native batched
+        # search_level_0 (VisitedTable amortized). Top-k is identical to the beam,
+        # so metrics are unchanged — only the latency path becomes real/native.
+        fu_matrix = None
+        if use_faiss and fu_embs_flat:
+            fu_matrix = np.ascontiguousarray(np.vstack(fu_embs_flat), dtype="float32")
+            scores, indices = faiss_level0_search_batch(
+                self.index, fu_matrix, fu_eps_flat, ef_search, k
+            )
+            for row, turn_key in enumerate(fu_keys_flat):
+                add_to_run(run, turn_key, scores[row], indices[row], self.id_map)
 
         metrics = ir_measures.calc_aggregate(
             [nDCG @ 3, nDCG @ k, RR @ k],
@@ -608,6 +725,7 @@ class HnswCombinedEvaluator:
             first_ms = 0.0
             followup_ms = 0.0
             old = self.index.hnsw.efSearch
+            # First turns: q0 always runs alone (it is what establishes the entry point).
             for conv_id in conv_q0_emb:
                 q0_emb = conv_q0_emb[conv_id]
                 self.index.hnsw.efSearch = ef_search * up
@@ -616,10 +734,20 @@ class HnswCombinedEvaluator:
                 first_ms += (time.perf_counter() - t0) * 1000
                 self.index.hnsw.efSearch = old
 
-                if conv_id in conv_fu_embs:
+            # Follow-ups. faiss: ONE global batched seeded search (VisitedTable
+            # amortized) — the real, paper-faithful latency, matched to the batched
+            # baseline. cpp/python: per-conversation kernel calls (correctness/debug).
+            if use_faiss:
+                if fu_matrix is not None:
                     t0 = time.perf_counter()
-                    self._toploc_search(conv_fu_embs[conv_id], conv_entry_points[conv_id], ef_search)
+                    faiss_level0_search_batch(self.index, fu_matrix, fu_eps_flat, ef_search, k)
                     followup_ms += (time.perf_counter() - t0) * 1000
+            else:
+                for conv_id in conv_q0_emb:
+                    if conv_id in conv_fu_embs:
+                        t0 = time.perf_counter()
+                        self._toploc_search(conv_fu_embs[conv_id], conv_entry_points[conv_id], ef_search)
+                        followup_ms += (time.perf_counter() - t0) * 1000
             self.index.hnsw.efSearch = old
             return first_ms, followup_ms
 
@@ -655,7 +783,16 @@ def parse_args():
     parser.add_argument("--k", type=int, default=int(os.environ.get("K", 10)))
     parser.add_argument("--threads", type=int, default=int(os.environ.get("THREADS", 1)))
     parser.add_argument("--max-turns", type=int, default=0, help="Debug limit. 0 means all judged turns.")
-    parser.add_argument("--backend", choices=["cpp", "python"], default=os.environ.get("BACKEND", "cpp"))
+    parser.add_argument(
+        "--backend",
+        choices=["faiss", "cpp", "python"],
+        default=os.environ.get("BACKEND", "faiss"),
+        help=(
+            "faiss = native search_level_0, globally batched (REAL latency, "
+            "paper-faithful; default). cpp/python = hand-rolled beam kernels "
+            "(correctness/debug only, slow)."
+        ),
+    )
     parser.add_argument("--progress", action="store_true", help="Print per-conversation TopLoc build progress.")
     parser.add_argument(
         "--sweep",
@@ -804,8 +941,13 @@ def main():
 
         print(f"\nCSV written: {out_csv} ({len(rows)} rows)")
 
-    if args.backend == "python":
-        print("\nNOTE: --backend python is correctness/debug only. Use --backend cpp for real latency.")
+    if args.backend != "faiss":
+        print(
+            "\nNOTE: --backend {} is a hand-rolled beam kernel (correctness/debug, slow).\n"
+            "      Use --backend faiss (default) for REAL, paper-faithful latency: native\n"
+            "      search_level_0, globally batched so the VisitedTable is amortized."
+            .format(args.backend)
+        )
 
 
 if __name__ == "__main__":
