@@ -54,9 +54,9 @@ from ir_measures import nDCG, RR
 
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
 )
 
 CACHE_DIRS = {
@@ -72,7 +72,7 @@ MSMARCO_CACHE_DIRS = {
     "dragon": os.path.join(CACHE_BASE, "msmarco", "dragon"),
 }
 MSMARCO_BASE = os.environ.get(
-    "MSMARCO_BASE", "/home/toploc1/Datasets/conversational/CAST2019/msmarco"
+    "MSMARCO_BASE", "/home/toploc2/Datasets/conversational/CAST2019/msmarco"
 )
 # dev queries (test set), per encoder. snowflake was precomputed (1024-d); the
 # dragon set (768-d) is produced once by encode_msmarco_dev_dragon.py into
@@ -87,8 +87,8 @@ MSMARCO_QRELS = os.path.join(MSMARCO_BASE, "qrels.dev.small.tsv")
 # Full msmarco train-query log (~808k rows = the paper's |Q_L|), separate from
 # the 367k train_query subset above. Used by --dataset msmarco-on-cast.
 MSMARCO_FULL_LOG_DIRS = {
-    "snowflake": "/home/toploc1/Datasets/conversational/msmarco/snowflake",
-    "dragon": "/home/toploc1/Datasets/conversational/msmarco/dragon",
+    "snowflake": "/home/toploc2/Datasets/conversational/msmarco/snowflake",
+    "dragon": "/home/toploc2/Datasets/conversational/msmarco/dragon",
 }
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"

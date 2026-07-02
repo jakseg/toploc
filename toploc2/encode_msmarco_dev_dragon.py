@@ -25,7 +25,7 @@ from toploc2_hnsw_pure_python import load_query_encoder, MSMARCO_DEV_QUERY_DIRS
 
 DEV_JSONL = os.environ.get(
     "DEV_JSONL",
-    "/home/toploc1/Datasets/conversational/CAST2019/msmarco/msmarco_queries/dev_queries.jsonl",
+    "/home/toploc2/Datasets/conversational/CAST2019/msmarco/msmarco_queries/dev_queries.jsonl",
 )
 SNOWFLAKE_DEV_DIR = MSMARCO_DEV_QUERY_DIRS["snowflake"]
 OUT_DIR = MSMARCO_DEV_QUERY_DIRS["dragon"]
