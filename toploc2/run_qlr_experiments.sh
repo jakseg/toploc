@@ -36,21 +36,25 @@ if [ "$MODEL" = "dragon" ]; then
 fi
 
 # 1. Ground truth for Accuracy@10 (exact top-10). Loads only the doc embeddings,
-#    NOT the HNSW index, so it does not compete for RAM with the eval runs.
-echo "== 1/3 ground truth (exact top-10) =="
+#    NOT the HNSW index, so it does not compete for RAM with the eval run. Threads
+#    the GEMM via OMP_NUM_THREADS (the matmul uses numpy/BLAS, not faiss threads).
+echo "== 1/2 ground truth (exact top-10) =="
+OMP_NUM_THREADS="${THREADS:-14}" \
 $PY -u compute_groundtruth.py "$MODEL" --dataset "$DATASET" --method stream \
   2>&1 | tee "$OUT/groundtruth.log"
 
-# 2. Plain-HNSW baseline curve — sweep efSearch 10..200 (the paper's comparison).
-echo "== 2/3 baseline sweep (plain HNSW) =="
+# 2. Baseline + QLR in ONE process so the ~157 GiB index loads only ONCE.
+#    --mode both runs the plain-HNSW efSearch sweep AND the QLR sweep
+#    (th x k' x ef-search x PCA), writing both into one CSV (the 'mode' column
+#    separates them). EP/s_max are built once and reused across the QLR grid.
+#    --threads 1 is MANDATORY for paper-faithful latency (the paper searches
+#    single-threaded); latency_ms_per_q is then the amortized, comparable number.
+#    (GT above keeps many threads for its matmul — it doesn't touch the index.)
+echo "== 2/2 baseline + QLR sweep (single index load, threads=1 for faithful latency) =="
 $PY -u toploc2_hnsw_pure_python.py "$MODEL" --dataset "$DATASET" \
-  --mode baseline --sweep --out "$OUT/baseline_sweep.csv" \
-  2>&1 | tee "$OUT/baseline.log"
+  --mode both --sweep --log-limit "$LOG_LIMIT" --threads 1 \
+  --out "$OUT/sweep.csv" \
+  2>&1 | tee "$OUT/sweep.log"
 
-# 3. QLR sweep — th x k' x ef-search x PCA(0, dim/4). EP/s_max built once, reused.
-echo "== 3/3 QLR sweep =="
-$PY -u toploc2_hnsw_pure_python.py "$MODEL" --dataset "$DATASET" \
-  --sweep --log-limit "$LOG_LIMIT" --out "$OUT/qlr_sweep.csv" \
-  2>&1 | tee "$OUT/qlr.log"
-
-echo "Done. Compare baseline_sweep.csv vs qlr_sweep.csv (Accuracy@10 at matched cost) in $OUT/"
+echo "Done. In $OUT/sweep.csv compare mode=baseline vs mode=qlr at MATCHED Accuracy@10:"
+echo "  baseline latency_ms_per_q  vs  qlr latency_ms_per_q  ->  speedup (grows with the target)."

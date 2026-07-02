@@ -54,9 +54,9 @@ from ir_measures import nDCG, RR
 
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
 )
 
 CACHE_DIRS = {
@@ -72,7 +72,7 @@ MSMARCO_CACHE_DIRS = {
     "dragon": os.path.join(CACHE_BASE, "msmarco", "dragon"),
 }
 MSMARCO_BASE = os.environ.get(
-    "MSMARCO_BASE", "/home/toploc2/Datasets/conversational/CAST2019/msmarco"
+    "MSMARCO_BASE", "/home/toploc1/Datasets/conversational/CAST2019/msmarco"
 )
 # dev queries (test set), per encoder. snowflake was precomputed (1024-d); the
 # dragon set (768-d) is produced once by encode_msmarco_dev_dragon.py into
@@ -87,8 +87,8 @@ MSMARCO_QRELS = os.path.join(MSMARCO_BASE, "qrels.dev.small.tsv")
 # Full msmarco train-query log (~808k rows = the paper's |Q_L|), separate from
 # the 367k train_query subset above. Used by --dataset msmarco-on-cast.
 MSMARCO_FULL_LOG_DIRS = {
-    "snowflake": "/home/toploc2/Datasets/conversational/msmarco/snowflake",
-    "dragon": "/home/toploc2/Datasets/conversational/msmarco/dragon",
+    "snowflake": "/home/toploc1/Datasets/conversational/msmarco/snowflake",
+    "dragon": "/home/toploc1/Datasets/conversational/msmarco/dragon",
 }
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
@@ -399,6 +399,67 @@ def faiss_level0_search(index, graph, q_emb, entry_points, k=10, ef_search=64):
     return D, I, None
 
 
+def faiss_level0_search_batch(index, queries, entry_point_lists, ef_search, k=10):
+    """One `search_level_0` call over m queries -> FAISS allocates its
+    VisitedTable(ntotal) ONCE for the whole batch instead of once per query. This
+    is the paper-faithful way to TIME the seeded search: the per-query cost with
+    the scratch buffer amortized, single-threaded (the paper's "average query
+    latency"). The single-query `faiss_level0_search` re-allocates that table on
+    every call -> a benchmark artifact (~8-18 ms flat on the 38.6M index), NOT the
+    algorithm. See the latency notes in CLAUDE.md.
+
+    All m queries are searched at the SAME ef_search, so the caller groups routed
+    queries by their adaptive ef' first. Seed sets C have variable length; shorter
+    ones are padded up to the batch max with -1 (FAISS' "no entry" marker, which the
+    beam skips) so the batch has a uniform nprobe WITHOUT polluting results with
+    duplicate seeds. Results are IDENTICAL to looping `faiss_level0_search`
+    (asserted in test_qlr_pipeline).
+
+    queries: (m, d) float32. entry_point_lists: list of m int arrays (the seed set
+    C per query). Returns (D, I) of shape (m, k); rows with an empty C are blanked.
+    """
+    m = len(entry_point_lists)
+    if m == 0:
+        return np.empty((0, k), "float32"), np.empty((0, k), "int64")
+    Q = np.ascontiguousarray(queries, dtype="float32").reshape(m, -1)
+    cleaned = [np.asarray(c, dtype="int64") for c in entry_point_lists]
+    cleaned = [c[c >= 0] for c in cleaned]
+    nprobe = max((len(c) for c in cleaned), default=0)
+    D = np.full((m, k), -np.inf, dtype="float32")
+    I = np.full((m, k), -1, dtype="int64")
+    if nprobe == 0:
+        return D, I
+    empty = [i for i, c in enumerate(cleaned) if len(c) == 0]
+    nearest = np.full((m, nprobe), -1, dtype="int32")       # -1 = padding, skipped by the beam
+    for i, c in enumerate(cleaned):
+        nearest[i, :len(c)] = c.astype("int32")
+    # seed distances for the whole batch at once: negated inner products (FAISS HNSW
+    # is "smaller = better"; assumes METRIC_INNER_PRODUCT). Padded (-1) slots get
+    # +inf so they are never selected even by a build that does not skip them.
+    recon = np.where(nearest.reshape(-1) < 0, 0, nearest.reshape(-1)).astype("int64")
+    vecs = reconstruct_batch_safe(index, recon).reshape(m, nprobe, -1)
+    nearest_d = (-(np.einsum("mpd,md->mp", vecs, Q))).astype("float32")
+    nearest_d[nearest < 0] = np.inf
+    nearest_d = np.ascontiguousarray(nearest_d)
+    nearest = np.ascontiguousarray(nearest)
+    old_ef = index.hnsw.efSearch
+    index.hnsw.efSearch = int(ef_search)
+    try:
+        args = (m, faiss.swig_ptr(Q), k,
+                faiss.swig_ptr(nearest), faiss.swig_ptr(nearest_d),
+                faiss.swig_ptr(D), faiss.swig_ptr(I), nprobe, 2)
+        try:
+            index.search_level_0(*args)
+        except TypeError:                               # some builds want the params arg
+            index.search_level_0(*args, None)
+    finally:
+        index.hnsw.efSearch = old_ef
+    for i in empty:
+        D[i] = -np.inf
+        I[i] = -1
+    return D, I
+
+
 # ================= QLR STEP 1 — QUERY LOG INDEX (I_Q) =================
 def build_query_log_index(log_emb, m=32, ef_construction=500, ef_search=64):
     """Build I_Q, the query-log index: an HNSW graph over the historical query
@@ -696,6 +757,94 @@ def build_run_qlr(index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s
     return run, route_flags, sims, visited_counts, routed_ms, fallback_ms
 
 
+def measure_qlr_latency_faithful(index, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                                 k, k_prime, th, ef_default, ef_min, pca=None, log_emb_full=None):
+    """Paper-faithful QLR latency: the per-query cost with the FAISS per-call scratch
+    (VisitedTable(ntotal)) AMORTIZED, single-threaded — i.e. the paper's "average
+    query latency". Every FAISS op is BATCHED so a search *call* allocates its
+    ntotal-sized table ~once per phase instead of once per query (the single-query
+    build_run_qlr/route path re-allocates it every query -> the flat ~18 ms
+    artifact; see CLAUDE.md). Set faiss threads to 1 for a paper-comparable number.
+
+    Phases (each timed): (1) routing = PCA projection + I_Q search + s recompute,
+    batched over all queries; (2) fallback = one batched plain index.search at
+    ef_default over the un-routed queries; (3) seeded = routed queries grouped by
+    their adaptive ef', one batched search_level_0 per group. The candidate-set
+    union (Alg. 1 line 5) is Python glue and left UNtimed (a compiled impl amortizes
+    it); the seed-vector reconstruct IS timed (real per-query work).
+
+    Returns (run, route_flags, sims, timing, routed_n). The run's top-k is identical
+    to build_run_qlr's (asserted in test_qlr_pipeline), so metrics come from it too.
+    timing has per-query ms: latency_ms_per_q (total) + qlr_route/seeded/fallback.
+    """
+    N = len(eval_keys)
+    Q = np.ascontiguousarray(query_matrix, dtype="float32")
+
+    # ---- Phase 1: routing (PCA projection + I_Q search + s), BATCHED ----
+    t0 = time.perf_counter()
+    if pca is not None:
+        Qiq = np.ascontiguousarray(pca_apply(pca, Q), dtype="float32")
+        faiss.normalize_L2(Qiq)
+    else:
+        Qiq = Q
+    sims_iq, logidx = iq.search(Qiq, k_prime)
+    if pca is not None:
+        first = logidx[:, 0]
+        s = np.full(N, -np.inf, dtype="float64")
+        valid = first >= 0
+        s[valid] = np.einsum("nd,nd->n", Q[valid].astype("float64"),
+                             log_emb_full[first[valid]].astype("float64"))
+    else:
+        s = sims_iq[:, 0].astype("float64")
+    route_ms = (time.perf_counter() - t0) * 1000
+
+    routed_mask = (logidx[:, 0] >= 0) & (s >= th)
+    routed_idx = np.nonzero(routed_mask)[0]
+    fb_idx = np.nonzero(~routed_mask)[0]
+    run = defaultdict(dict)
+
+    # ---- Phase 2: fallback = one batched plain HNSW search at ef_default ----
+    fallback_ms = 0.0
+    if len(fb_idx):
+        old_ef = index.hnsw.efSearch
+        index.hnsw.efSearch = ef_default
+        t0 = time.perf_counter()
+        f_scores, f_idx = index.search(np.ascontiguousarray(Q[fb_idx]), k)
+        fallback_ms = (time.perf_counter() - t0) * 1000
+        index.hnsw.efSearch = old_ef
+        for r, i in enumerate(fb_idx):
+            add_to_run(run, eval_keys[i], f_scores[r], f_idx[r], id_map)
+
+    # ---- Phase 3: seeded search, routed queries grouped by ef', BATCHED ----
+    seeded_ms = 0.0
+    if len(routed_idx):
+        C_list, ef_of = [], np.empty(len(routed_idx), dtype="int64")
+        for j, i in enumerate(routed_idx):                     # untimed glue (union of EP)
+            matched = [int(x) for x in logidx[i] if x >= 0]
+            C = np.unique(ep_table[matched].ravel())
+            C_list.append(C[C >= 0])
+            ef_of[j] = max(adaptive_ef_search(float(s[i]), s_max, th, ef_default, ef_min), k)
+        for ef_val in np.unique(ef_of):                        # ef' mostly collapses -> few calls
+            gsel = np.nonzero(ef_of == ef_val)[0]
+            Qg = Q[routed_idx[gsel]]
+            Cg = [C_list[j] for j in gsel]
+            t0 = time.perf_counter()
+            Dg, Ig = faiss_level0_search_batch(index, Qg, Cg, ef_search=int(ef_val), k=k)
+            seeded_ms += (time.perf_counter() - t0) * 1000
+            for r, j in enumerate(gsel):
+                add_to_run(run, eval_keys[int(routed_idx[j])], Dg[r], Ig[r], id_map)
+
+    routed_n = int(len(routed_idx))
+    total_ms = route_ms + fallback_ms + seeded_ms
+    timing = {
+        "latency_ms_per_q": round(total_ms / N, 4) if N else float("nan"),
+        "qlr_route_ms_per_q": round(route_ms / N, 4) if N else float("nan"),
+        "qlr_seeded_ms_per_q": round(seeded_ms / routed_n, 4) if routed_n else float("nan"),
+        "qlr_fallback_ms_per_q": round(fallback_ms / len(fb_idx), 4) if len(fb_idx) else float("nan"),
+    }
+    return run, routed_mask.tolist(), s.tolist(), timing, routed_n
+
+
 def topk_match_rate(run_a, run_b, keys, k):
     """Mean |top-k(a) ∩ top-k(b)| / k over `keys` (1.0 = the two backends return
     identical result sets). Used to confirm the FAISS backend matches the Python
@@ -734,22 +883,28 @@ def routing_similarities(query_matrix, iq, k_prime, pca=None, log_emb_full=None)
 SWEEP_COLUMNS = [
     "model", "dataset", "mode", "th", "k_prime", "ef", "pca",
     "route_rate", "NDCG@3", "NDCG@10", "MRR@10", "Accuracy@10",
-    "avg_visited", "routed_ms_per_q", "fallback_ms_per_q",
-    # --compare-backends only: FAISS search_level_0 routed latency next to the
-    # pure-Python one (routed_ms_per_q), their ratio, and a correctness check.
+    "avg_visited",
+    # PAPER-FAITHFUL latency (batched, threads=1, VisitedTable amortized) — THE
+    # comparison column: baseline = batched ms/q; qlr = route+seeded+fallback.
+    "latency_ms_per_q", "qlr_route_ms_per_q", "qlr_seeded_ms_per_q", "qlr_fallback_ms_per_q",
+    # single-query (indicative / the ~18 ms artifact) — only under --compare-backends.
+    "routed_ms_per_q", "fallback_ms_per_q",
     "routed_ms_faiss_per_q", "speedup_routed", "topk_match",
 ]
 
 
 def write_sweep_results(rows, out_path):
-    """Write the sweep rows to CSV and print a compact markdown table."""
+    """Write the sweep rows to CSV (same csv.DictWriter convention as
+    combine_all3 / combine_base_top_hnsw; creates the parent dir if needed)
+    and print a compact markdown table."""
     import csv
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=SWEEP_COLUMNS)
         w.writeheader()
         for r in rows:
             w.writerow({c: r.get(c, "") for c in SWEEP_COLUMNS})
-    print(f"\nWrote {len(rows)} rows -> {out_path}", flush=True)
+    print(f"\nCSV written: {out_path} ({len(rows)} rows)", flush=True)
 
     def fmt(v):
         if isinstance(v, float):
@@ -798,8 +953,9 @@ def main():
                         default=os.environ.get("COMPARE_BACKENDS", "") == "1",
                         help="in --sweep: also run the FAISS backend and add "
                              "routed_ms_faiss_per_q / speedup_routed / topk_match columns")
-    parser.add_argument("--mode", choices=["qlr", "baseline"], default=os.environ.get("MODE", "qlr"),
-                        help="qlr (routed, default) or baseline (plain HNSW, the comparison)")
+    parser.add_argument("--mode", choices=["qlr", "baseline", "both"], default=os.environ.get("MODE", "qlr"),
+                        help="qlr (routed, default), baseline (plain HNSW), or both "
+                             "(baseline + qlr in ONE process so the index loads once)")
     parser.add_argument("--sweep", action="store_true",
                         help="sweep hyperparameters, building EP/s_max (and I_Q per PCA) once")
     parser.add_argument("--th-list", default=os.environ.get("TH_LIST", ""),
@@ -938,44 +1094,55 @@ def main():
               f"(run compute_groundtruth.py to enable it)", flush=True)
 
     def make_row(mode, th, k_prime, ef, pca_dim, metrics, route_rate, avg_visited,
-                 routed_ms, fallback_ms, routed_n, fallback_n):
-        return {
+                 routed_ms, fallback_ms, routed_n, fallback_n, timing=None):
+        row = {
             "model": model_name, "dataset": dataset, "mode": mode,
             "th": "" if th is None else round(float(th), 4),
             "k_prime": "" if k_prime is None else k_prime,
-            "ef": ef, "pca": pca_dim, "route_rate": route_rate,
-            "NDCG@3": metrics.get("NDCG@3", float("nan")),
-            "NDCG@10": metrics.get(f"NDCG@{k}", float("nan")),
-            "MRR@10": metrics.get(f"MRR@{k}", float("nan")),
-            "Accuracy@10": metrics.get(f"Accuracy@{k}", float("nan")),
-            "avg_visited": round(avg_visited, 1) if avg_visited == avg_visited else float("nan"),
+            "ef": ef, "pca": pca_dim, "route_rate": round(route_rate, 4),
+            "NDCG@3": round(metrics.get("NDCG@3", float("nan")), 4),
+            "NDCG@10": round(metrics.get(f"NDCG@{k}", float("nan")), 4),
+            "MRR@10": round(metrics.get(f"MRR@{k}", float("nan")), 4),
+            "Accuracy@10": round(metrics.get(f"Accuracy@{k}", float("nan")), 4),
+            "avg_visited": round(avg_visited, 2) if avg_visited == avg_visited else float("nan"),
             "routed_ms_per_q": round(routed_ms / routed_n, 4) if routed_n else float("nan"),
             "fallback_ms_per_q": round(fallback_ms / fallback_n, 4) if fallback_n else float("nan"),
         }
+        if timing:
+            row.update(timing)
+        return row
 
+    # Default output mirrors combine_all3 / combine_base_top_hnsw: results/raw/<kind>/
+    # with the run params + mmap flag in the name. --out still overrides.
     out_path = args.out or os.path.join(
-        os.getcwd(), f"qlr_sweep_{args.mode}_{model_name}_{dataset}.csv")
+        "results", "raw", "qlr",
+        f"qlr_{model_name}_{dataset}_{args.mode}_log{args.log_limit}_mmap{int(USE_MMAP)}.csv")
 
     # ================= BASELINE: plain HNSW (the apples-to-apples comparison) =================
-    if args.mode == "baseline":
-        ef_list = (_parse_int_list(args.ef_list) if args.ef_list else
-                   (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
-        print(f"\n[baseline] plain HNSW search (no routing), efSearch in {ef_list}", flush=True)
-        rows = []
-        for ef in ef_list:
+    # --mode both runs baseline AND qlr in this same process, so the giant index is
+    # loaded only ONCE; the rows are merged into a single CSV at the end.
+    baseline_rows = []
+    if args.mode in ("baseline", "both"):
+        ef_list_b = (_parse_int_list(args.ef_list) if args.ef_list else
+                     (list(range(10, 201, 10)) if args.sweep else [args.ef_default]))
+        print(f"\n[baseline] plain HNSW search (no routing), efSearch in {ef_list_b}", flush=True)
+        for ef in ef_list_b:
             run, total_ms = build_run_baseline(index, query_matrix, eval_keys, id_map, k, ef)
             metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
             row = make_row("baseline", None, None, ef, 0, metrics,
                            route_rate=0.0, avg_visited=float("nan"),
-                           routed_ms=0.0, fallback_ms=total_ms, routed_n=0, fallback_n=N)
-            rows.append(row)
+                           routed_ms=0.0, fallback_ms=total_ms, routed_n=0, fallback_n=N,
+                           timing={"latency_ms_per_q": round(total_ms / N, 4)})
+            baseline_rows.append(row)
             print(f"  ef={ef:4d}  NDCG@{k}={row['NDCG@10']:.4f}  MRR@{k}={row['MRR@10']:.4f}  "
                   f"Acc@{k}={row['Accuracy@10']:.4f}  {total_ms / N:.3f} ms/q", flush=True)
-        if args.sweep:
-            write_sweep_results(rows, out_path)
-        print("\nNOTE: pure-Python; batch latency is indicative only. The metrics "
-              "(NDCG/MRR/Accuracy) are real and directly comparable to the QLR run.")
-        return
+        if args.mode == "baseline":
+            if args.sweep:
+                write_sweep_results(baseline_rows, out_path)
+            print("\nNOTE: pure-Python; batch latency is indicative only. The metrics "
+                  "(NDCG/MRR/Accuracy) are real and directly comparable to the QLR run.")
+            return
+        # mode == "both": the index stays loaded — fall through to QLR, merge at the end.
 
     # ================= QLR: build EP/s_max once, then route =================
     # Q_L: msmarco uses the train-query split (the historical log); cast2019 uses
@@ -1043,61 +1210,61 @@ def main():
         for th in th_list:
             for k_prime in kprime_list:
                 for ef in ef_list:
-                    # In --compare-backends the primary run is forced to python so
-                    # it stays the correctness reference; faiss runs as the 2nd pass.
-                    backend = "python" if args.compare_backends else args.level0_backend
-                    (run, route_flags, sims, visited_counts,
-                     routed_ms, fallback_ms) = build_run_qlr(
-                        index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                    # Primary = paper-faithful batched latency (VisitedTable amortized,
+                    # threads=1). Its run's top-k is identical to the single-query path
+                    # (test-validated), so metrics come from it. --compare-backends
+                    # ADDS the single-query python/faiss passes (visited counts, the
+                    # ~18 ms artifact column, a topk cross-check) — use on a small grid.
+                    run, route_flags, sims, timing, routed_n = measure_qlr_latency_faithful(
+                        index, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
                         k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
-                        pca=pca, log_emb_full=log_emb, level0_backend=backend,
+                        pca=pca, log_emb_full=log_emb,
                     )
                     metrics = compute_metrics(run, filtered_qrels, gt, eval_keys, k)
-                    routed_n = int(sum(route_flags))
-                    fallback_n = N - routed_n
-                    avg_visited = float(np.mean(visited_counts)) if visited_counts else float("nan")
                     row = make_row("qlr", th, k_prime, ef, pca_dim, metrics,
-                                   route_rate=routed_n / N, avg_visited=avg_visited,
-                                   routed_ms=routed_ms, fallback_ms=fallback_ms,
-                                   routed_n=routed_n, fallback_n=fallback_n)
+                                   route_rate=routed_n / N, avg_visited=float("nan"),
+                                   routed_ms=0.0, fallback_ms=0.0, routed_n=0, fallback_n=0,
+                                   timing=timing)
                     extra = ""
                     if args.compare_backends:
-                        (run_f, _f_flags, _f_sims, _f_vis,
-                         routed_ms_f, _f_fb) = build_run_qlr(
+                        (run_py, py_flags, _s, vis_py,
+                         r_ms_py, f_ms_py) = build_run_qlr(
+                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                            k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
+                            pca=pca, log_emb_full=log_emb, level0_backend="python",
+                        )
+                        (run_fs, _ff, _fs, _fv, r_ms_fs, _ffb) = build_run_qlr(
                             index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
                             k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
                             pca=pca, log_emb_full=log_emb, level0_backend="faiss",
                         )
+                        py_routed_n = int(sum(py_flags))
+                        py_fb_n = N - py_routed_n
                         routed_keys = [eval_keys[i] for i, r in enumerate(route_flags) if r]
-                        row["routed_ms_faiss_per_q"] = (round(routed_ms_f / routed_n, 4)
-                                                        if routed_n else float("nan"))
-                        row["speedup_routed"] = (round(routed_ms / routed_ms_f, 2)
-                                                 if routed_ms_f else float("nan"))
-                        row["topk_match"] = round(topk_match_rate(run, run_f, routed_keys, k), 4)
-                        extra = (f" | faiss={row['routed_ms_faiss_per_q']:.3f}ms "
-                                 f"speedup={row['speedup_routed']:.2f}x "
-                                 f"match={row['topk_match']:.3f}")
+                        row["avg_visited"] = round(float(np.mean(vis_py)), 2) if vis_py else float("nan")
+                        row["routed_ms_per_q"] = round(r_ms_py / py_routed_n, 4) if py_routed_n else float("nan")
+                        row["fallback_ms_per_q"] = round(f_ms_py / py_fb_n, 4) if py_fb_n else float("nan")
+                        row["routed_ms_faiss_per_q"] = round(r_ms_fs / py_routed_n, 4) if py_routed_n else float("nan")
+                        row["topk_match"] = round(topk_match_rate(run, run_fs, routed_keys, k), 4)
+                        extra = (f" | seeded={timing['qlr_seeded_ms_per_q']:.3f} "
+                                 f"faiss1q={row['routed_ms_faiss_per_q']:.3f} "
+                                 f"visited={row['avg_visited']:.0f} match={row['topk_match']:.3f}")
                     rows.append(row)
                     th_used, kprime_used, ef_used = th, k_prime, ef
                     print(f"  pca={pca_dim:>4} th={th:<8} k'={k_prime} ef={ef:<4} | "
                           f"route={routed_n / N:5.1%} NDCG@{k}={rows[-1]['NDCG@10']:.4f} "
                           f"MRR@{k}={rows[-1]['MRR@10']:.4f} Acc@{k}={rows[-1]['Accuracy@10']:.4f} "
-                          f"visited={avg_visited:.0f}{extra}", flush=True)
+                          f"lat={timing['latency_ms_per_q']:.3f}ms{extra}", flush=True)
 
     if args.sweep:
-        write_sweep_results(rows, out_path)
-        if args.compare_backends:
-            print("\nNOTE: routed_ms_per_q = pure-Python beam (indicative); "
-                  "routed_ms_faiss_per_q = FAISS search_level_0 (REAL C++ latency). "
-                  "topk_match≈1.0 confirms identical results -> speedup_routed is the "
-                  "honest gain. NDCG/MRR/Accuracy are real numbers.")
-        elif args.level0_backend == "faiss":
-            print("\nNOTE: routed search via FAISS search_level_0 -> routed_ms_per_q "
-                  "is REAL C++ latency. NDCG/MRR/Accuracy are real numbers.")
-        else:
-            print("\nNOTE: pure-Python routed search; routed latency is indicative "
-                  "only (use --level0-backend faiss / --compare-backends for real "
-                  "C++ latency). NDCG/MRR/Accuracy are real numbers.")
+        write_sweep_results(baseline_rows + rows, out_path)
+        print("\nNOTE: latency_ms_per_q = PAPER-FAITHFUL per-query latency (batched, "
+              "VisitedTable amortized, threads=1) — compare baseline vs qlr at MATCHED "
+              "Accuracy@10 (read off the speedup). qlr_route/seeded/fallback_ms_per_q "
+              "decompose it. NDCG/MRR/Accuracy are real. With --compare-backends the "
+              "single-query columns are added: routed_ms_faiss_per_q (the ~18 ms "
+              "artifact), routed_ms_per_q (python beam), avg_visited, topk_match "
+              "(faithful-vs-single cross-check, ~1.0).")
         return
 
     # ================= single-config detailed latency (warmup + timed sweeps) =================
@@ -1167,7 +1334,7 @@ def main():
     if visited_counts:
         print(f"Avg visited nodes (routed): {np.mean(visited_counts):.1f}")
     if args.out:
-        write_sweep_results(rows, out_path)
+        write_sweep_results(baseline_rows + rows, out_path)
     print("=" * 70)
     print("NOTE: routed search uses the pure-Python level-0 beam search; real")
     print("latency needs the C++ kernel. NDCG/MRR/Accuracy are real numbers.")

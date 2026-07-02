@@ -15,8 +15,8 @@ pip install -r requirements.txt
 ### 1. Create Embeddings
 
 ```bash
-python create_embeddings_snowflake.py   # Snowflake Arctic Embed (1024-dim)
-python create_embeddings_dragon.py      # Dragon+ (768-dim)
+python create_embeddings/create_embeddings_snowflake.py   # Snowflake Arctic Embed (1024-dim)
+python create_embeddings/create_embeddings_dragon.py      # Dragon+ (768-dim)
 ```
 
 Outputs are saved to `data/snowflake/` and `data/dragon/` respectively.
@@ -80,9 +80,13 @@ Driver: `toploc2_hnsw_pure_python.py` (pure Python, no C++). Two metrics are
 reported: **Accuracy@10** (fraction of the *exhaustive* top-10 retrieved — the
 paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
 
+All QLR scripts live in the **`toploc2/`** directory — `cd toploc2` first; the
+commands below are run from there (they import the driver as a sibling module).
+
 ### 0. Local sanity check (no server needed)
 
 ```bash
+cd toploc2
 conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
 python test_qlr_pipeline.py       # synthetic, runs in seconds -> 14/14 passed
 ```
@@ -118,30 +122,28 @@ Or the individual steps, in order:
    ```
 
 2. **ground truth for Accuracy@10** (one-time exact top-10; streams the doc
-   embeddings, does not load the HNSW index):
+   embeddings, does not load the HNSW index). The matmul uses numpy/BLAS, so
+   thread it via `OMP_NUM_THREADS`, not `--threads`:
    ```bash
-   python compute_groundtruth.py <model> --dataset msmarco-on-cast   # --method stream (default)
+   OMP_NUM_THREADS=14 python compute_groundtruth.py <model> --dataset msmarco-on-cast
    ```
 
-3. **plain-HNSW baseline** (the comparison) — sweep efSearch 10..200:
-   ```bash
-   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
-       --mode baseline --sweep --out baseline_sweep.csv
-   ```
-
-4. **QLR sweep** (`th × k' × ef × PCA`; EP/s_max built once and reused):
+3. **baseline + QLR in ONE run** — `--mode both` loads the ~157 GiB index *once*,
+   then runs the plain-HNSW efSearch sweep **and** the QLR sweep (`th × k' × ef ×
+   PCA`), writing both to one CSV (the `mode` column separates them; EP/s_max are
+   built once and reused across the QLR grid):
    ```bash
    python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
-       --sweep --log-limit 100000 --out qlr_sweep.csv
+       --mode both --sweep --log-limit 100000 --threads 14 --out sweep.csv
    ```
 
-Each sweep writes a CSV (and prints a markdown table). Compare `baseline_sweep.csv`
-vs `qlr_sweep.csv`: QLR should reach about the **same Accuracy@10 as the baseline**
-on the identical index. A quick single-config first run:
+In `sweep.csv` compare `mode=baseline` vs `mode=qlr`: QLR should reach about the
+**same Accuracy@10 as the baseline** on the identical index. A quick first run
+(also one index load):
 
 ```bash
 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
-    --log-limit 2000 --max-turns 50
+    --mode both --log-limit 2000 --max-turns 50
 ```
 
 ### Real routed latency (FAISS `search_level_0`)
@@ -221,7 +223,7 @@ demo uses a conda environment (`environment.yml`). A system C++ compiler is
 required for the build (macOS: `xcode-select --install`; Linux: `build-essential`).
 
 ```bash
-./build_demo.sh        # creates the 'toploc-demo' conda env and compiles toploc_search
+./demo/build_demo.sh   # creates the 'toploc-demo' conda env and compiles toploc_search
 ```
 
 This recreates the environment from `environment.yml` and builds

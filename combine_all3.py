@@ -48,9 +48,9 @@ import ir_measures
 from ir_measures import nDCG, RR
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
 )
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
@@ -626,8 +626,7 @@ if SWEEP:
     os.makedirs("results/raw/ivf", exist_ok=True)
 
     out_csv = (
-        f"results/raw/ivf/"
-        f"ivf_{model_name}_H{H}_A{ALPHA}_mmap{int(USE_MMAP)}.csv"
+        f"results/raw/ivf/" f"ivf_{model_name}_H{H}_A{ALPHA}_mmap{int(USE_MMAP)}.csv"
     )
 
     with open(out_csv, "w", newline="") as f:
