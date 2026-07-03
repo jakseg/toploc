@@ -668,6 +668,91 @@ def build_iq_for_pca(log_emb_full, pca):
     return build_query_log_index(log_proj)
 
 
+# ================= QLR ARTIFACT CACHE (EP + I_Q) =================
+# EP (the ~80-min |Q_L| document searches) and I_Q (the HNSW over Q_L) are the
+# only expensive build-time artifacts, and they depend solely on the document
+# index and the query log — not on the th/k'/ef/PCA sweep. So build each once and
+# cache it to disk; later runs load it in seconds instead of rebuilding.
+#
+# EP additionally stores FAISS document NODE ids, which are tied to one specific
+# hnsw_index.index. If that index is ever rebuilt the ids go stale silently, so
+# the EP cache records the index file's mtime+size and is rebuilt on a mismatch.
+def _index_signature(index_path):
+    st = os.stat(index_path)
+    return int(st.st_mtime), int(st.st_size)
+
+
+def ep_cache_path(cache_dir, model, dataset, k_ep, ep_build_ef_search, log_limit):
+    return os.path.join(
+        cache_dir,
+        f"ep_{model}_{dataset}_kep{k_ep}_ef{ep_build_ef_search}_log{log_limit}.npz",
+    )
+
+
+def load_or_build_ep(index, log_emb, cache_dir, model, dataset, index_path,
+                     k_ep=10, ep_build_ef_search=512, smax_percentile=75,
+                     log_limit=0, rebuild=False):
+    """Return (ep_table, s_max), loading a cached EP when one matches this
+    (model, dataset, k_ep, ep_build_ef_search, log_limit) AND the document index
+    is unchanged; otherwise run the ~80-min build and cache the result. The
+    mtime+size guard catches a rebuilt hnsw_index.index (whose node ids, stored
+    in ep_table, would otherwise be silently stale). log_limit=0 = full log."""
+    path = ep_cache_path(cache_dir, model, dataset, k_ep, ep_build_ef_search, log_limit)
+    mtime, size = _index_signature(index_path)
+    if not rebuild and os.path.exists(path):
+        d = np.load(path)
+        if int(d["id_mtime"]) == mtime and int(d["id_size"]) == size:
+            ep_table = d["ep_table"]
+            s_max = float(d["s_max"])
+            print(f"  EP loaded from cache: {os.path.basename(path)} "
+                  f"({len(ep_table):,} log queries, s_max={s_max:.4f})", flush=True)
+            return ep_table, s_max
+        print(f"  EP cache ignored (document index changed since it was built) "
+              f"-> rebuilding {os.path.basename(path)}", flush=True)
+    ep_table, s_max = build_lookup_table(
+        index, log_emb, k_ep=k_ep, ep_build_ef_search=ep_build_ef_search,
+        smax_percentile=smax_percentile)
+    os.makedirs(cache_dir, exist_ok=True)
+    np.savez(path, ep_table=ep_table, s_max=np.float64(s_max),
+             id_mtime=np.int64(mtime), id_size=np.int64(size))
+    print(f"  EP saved to cache: {os.path.basename(path)}", flush=True)
+    return ep_table, s_max
+
+
+def iq_cache_path(cache_dir, model, dataset, log_limit, pca_dim):
+    return os.path.join(
+        cache_dir, f"iq_{model}_{dataset}_log{log_limit}_pca{pca_dim}.index")
+
+
+def load_or_build_iq(log_emb, cache_dir, model, dataset, log_limit, pca_dim,
+                     rebuild=False):
+    """Return (iq, pca). Cache the HNSW query-log index (faiss.write_index) and,
+    for pca>0, the trained PCA matrix next to it. Keyed by
+    (model, dataset, log_limit, pca_dim) — I_Q is built over the query log only,
+    so it needs no document-index guard."""
+    path = iq_cache_path(cache_dir, model, dataset, log_limit, pca_dim)
+    pca_path = path[: -len(".index")] + ".pca"
+    has_pca = bool(pca_dim and pca_dim > 0)
+    if (not rebuild and os.path.exists(path)
+            and (not has_pca or os.path.exists(pca_path))):
+        iq = faiss.read_index(path)
+        pca = faiss.read_VectorTransform(pca_path) if has_pca else None
+        print(f"  I_Q loaded from cache: {os.path.basename(path)}", flush=True)
+        return iq, pca
+    if has_pca:
+        pca = build_pca(log_emb, pca_dim)
+        iq = build_iq_for_pca(log_emb, pca)
+    else:
+        pca = None
+        iq = build_query_log_index(log_emb)
+    os.makedirs(cache_dir, exist_ok=True)
+    faiss.write_index(iq, path)
+    if pca is not None:
+        faiss.write_VectorTransform(pca, pca_path)
+    print(f"  I_Q saved to cache: {os.path.basename(path)}", flush=True)
+    return iq, pca
+
+
 # ================= GROUND TRUTH / ACCURACY@10 =================
 def groundtruth_path(cache_dir, model_name, dataset, k):
     """Where compute_groundtruth.py writes the exact top-k for the dev queries."""
@@ -977,6 +1062,9 @@ def main():
                              "msmarco passages as MARCO_<n> — with the msmarco log/dev/qrels)")
     parser.add_argument("--log-limit", type=int, default=int(os.environ.get("LOG_LIMIT", 0)),
                         help="cap |Q_L| for quick runs (0 = full log)")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help="ignore any cached EP/I_Q artifacts and rebuild them "
+                             "from scratch, then overwrite the cache")
     parser.add_argument("--max-turns", type=int, default=0, help="Debug limit. 0 means all eval turns.")
     parser.add_argument("--threads", type=int, default=int(os.environ.get("THREADS", os.cpu_count() or 1)))
     args = parser.parse_args()
@@ -1160,12 +1248,15 @@ def main():
 
     # EP + s_max depend only on k_ep (fixed) and the doc index — build them ONCE
     # and reuse across the whole th/k'/ef/PCA sweep (the |Q_L| doc searches are
-    # the expensive part). I_Q is (re)built per distinct PCA dim below.
+    # the expensive part), and cache them to disk so later runs skip the ~80-min
+    # build entirely. I_Q is (re)built/cached per distinct PCA dim below.
     t0 = time.perf_counter()
-    ep_table, s_max = build_lookup_table(index, log_emb, k_ep=args.k_ep)
+    ep_table, s_max = load_or_build_ep(
+        index, log_emb, cache_dir, model_name, dataset, index_path,
+        k_ep=args.k_ep, log_limit=args.log_limit, rebuild=args.rebuild_cache)
     build_ms = (time.perf_counter() - t0) * 1000
     print(f"  Q_L size={len(log_emb):,} | k_ep={args.k_ep} | s_max={s_max:.4f} | "
-          f"EP built in {build_ms:.1f} ms", flush=True)
+          f"EP ready in {build_ms:.1f} ms", flush=True)
 
     dim = log_emb.shape[1]
     pca_list = (_parse_int_list(args.pca_list) if args.pca_list else
@@ -1182,11 +1273,9 @@ def main():
     for pca_dim in pca_list:
         if pca_dim and pca_dim > 0:
             print(f"\n[I_Q] PCA {dim} -> {pca_dim}", flush=True)
-            pca = build_pca(log_emb, pca_dim)
-            iq = build_iq_for_pca(log_emb, pca)
-        else:
-            pca = None
-            iq = build_query_log_index(log_emb)
+        iq, pca = load_or_build_iq(
+            log_emb, cache_dir, model_name, dataset, args.log_limit, pca_dim,
+            rebuild=args.rebuild_cache)
 
         # Resolve th. dragon is on the raw dot-product scale, where 0.5 is
         # meaningless, so calibrate from the actual routing-similarity distribution.
