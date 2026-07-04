@@ -74,7 +74,7 @@ def stage_coverage():
 
     normalize = MODEL != "dragon"
     dev_dir = qlr.MSMARCO_DEV_QUERY_DIRS[MODEL]
-    q_ids, _ = qlr.load_parquet_embeddings(dev_dir, normalize=normalize)
+    q_ids, q_emb = qlr.load_parquet_embeddings(dev_dir, normalize=normalize)
     eval_keys = [qid for qid in q_ids if qid in filtered_qrels]
     print(f"dragon dev queries: {len(q_ids):,} | with qrels (N): {len(eval_keys):,}",
           flush=True)
@@ -96,6 +96,56 @@ def stage_coverage():
         n_gt = sum(1 for k in eval_keys if gt.get(k))
         print(f"groundtruth entries covering eval set: {n_gt:,}/{len(eval_keys):,}  "
               f"({gt_path})", flush=True)
+
+    # --- 1b. dev embedding VALUE sanity (IDs matched, but are the vectors real?) ---
+    # The parity check above only compares IDs. A wrong/degenerate embedding file
+    # (all-zero, NaN, duplicated rows, or wrong scale) would pass every check so
+    # far yet retrieve garbage. dragon is un-normalised (raw dot product), so we
+    # expect norms clustered around some model-specific value, NOT ~1 and NOT ~0.
+    norms = np.linalg.norm(q_emb, axis=1)
+    n_nan = int(np.isnan(q_emb).any(axis=1).sum())
+    n_zero = int((norms == 0).sum())
+    n_unique_rows = len(np.unique(q_emb, axis=0))
+    print("\n=== 1b. dragon dev-embedding value sanity ===", flush=True)
+    print(f"norm: min={norms.min():.4f} mean={norms.mean():.4f} max={norms.max():.4f} "
+          f"| NaN rows={n_nan} | zero rows={n_zero} | unique rows={n_unique_rows}/{len(q_emb)}",
+          flush=True)
+    if n_nan or n_zero or n_unique_rows < len(q_emb) * 0.99:
+        print("  WARNING: degenerate dev embeddings (NaN / zero / duplicated) -> "
+              "re-run encode_msmarco_dev_dragon.py; the encoder output is broken.",
+              flush=True)
+
+    # --- 1c. exact-GT vs qrels: are the dragon embeddings even MEANINGFUL? ---
+    # gt = exact top-10 by dragon(dev) . dragon(doc) dot product (built by
+    # compute_groundtruth.py in the SAME MARCO_/CAR_ pid space as qrels). If the
+    # dragon dev+doc embeddings align and are meaningful, exact search should land
+    # a qrels-relevant passage in the top-10 for a good fraction of queries (msmarco
+    # dense retrievers: tens of %). If this is ~0, the embeddings themselves are the
+    # problem (wrong encoder / DRAGON query-vs-context mixup / bad normalization) and
+    # NO index load is needed to know it. If this is HEALTHY but the run's Accuracy
+    # is 0, the bug is downstream in the run (id_map ordering / HNSW search), which
+    # --stage search then pins down.
+    if gt is not None:
+        gt_hits = 0
+        for qid in eval_keys:
+            gt_top = set((gt.get(qid) or [])[:K])
+            if gt_top & set(filtered_qrels[qid].keys()):
+                gt_hits += 1
+        rate = gt_hits / max(len(eval_keys), 1)
+        print("\n=== 1c. exact-groundtruth quality vs qrels (no index load) ===",
+              flush=True)
+        print(f"exact top-{K} contains a qrels pid for {gt_hits:,}/{len(eval_keys):,} "
+              f"queries ({rate:.1%})", flush=True)
+        if rate < 0.05:
+            print("  => exact search itself barely hits qrels: the dragon dev/doc "
+                  "EMBEDDINGS are misaligned or meaningless (encoder/normalization). "
+                  "This is the root cause; fix the embeddings, not QLR. No 129 GB "
+                  "index load needed.", flush=True)
+        else:
+            print("  => exact search IS meaningful, so the dragon embeddings are "
+                  "fine. Since the run reported ~0, the break is downstream (id_map "
+                  "ordering or the HNSW search itself) -> run --stage search to "
+                  "confirm HNSW top-k vs this exact top-k.", flush=True)
 
     print("\n=== 2. hnsw_ids.npy + index-file sanity (no index load) ===", flush=True)
     ok_count = len(id_array) == EXPECTED_NTOTAL
