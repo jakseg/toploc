@@ -61,7 +61,12 @@ DATASET_DIR = os.environ.get(
 
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
-    "dragon": os.path.join(CACHE_BASE, "dragon"),
+    # dragon points at the preserved L2-NORMALISED (cosine) build. The un-normalised
+    # dot-product indexes at .../dragon/ break HNSW/IVF graph search (~0 recall);
+    # the correct normalised indexes are in the _cosine_old/ subfolder. EP/I_Q/GT
+    # caches are written here too. After a clean rebuild with the fixed
+    # create_index.py (normalize_vecs=True) this can go back to just "dragon".
+    "dragon": os.path.join(CACHE_BASE, "dragon", "_cosine_old"),
 }
 
 # msmarco (QLR / toploc2): the collection HNSW index lives in its own cache; the
