@@ -101,10 +101,12 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
     checkpoint_path = os.path.join(cache_dir, f"{index_type}_checkpoint.json")
     params = INDEX_PARAMS[model_name].get(index_type, {})
 
-    # dragon (dragon-plus) is trained for raw dot product — the embedding
-    # magnitude carries signal, so normalizing to cosine costs ~0.06 nDCG.
-    # snowflake (arctic-embed) is trained for cosine, so it must stay normalized.
-    normalize_vecs = model_name != "dragon"
+    # L2-normalize (cosine) for BOTH models. dragon-plus is trained for raw dot
+    # product, but HNSW/IVF graph search degenerates on un-normalized inner
+    # product (norm-bias hubs -> greedy search unreachable -> ~0 recall, while
+    # exact is unaffected). The toploc1 paper L2-normalizes Dragon before indexing
+    # for exactly this reason. Keep all index types on the same cosine scale.
+    normalize_vecs = True
     log.info(f"[{index_type}] normalize_L2={normalize_vecs} (model={model_name})")
 
     # Resume or init

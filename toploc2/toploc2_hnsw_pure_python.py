@@ -1073,11 +1073,11 @@ def main():
 
     model_name = args.model
     dataset = args.dataset
-    # dragon-plus is trained for raw dot product (its document index is built
-    # un-normalised, see create_index.py); snowflake (arctic-embed) is cosine.
-    # Keep the query log / dev queries on the model's native scale so s, s_max and
-    # th are mutually consistent.
-    normalize = model_name != "dragon"
+    # Both models use cosine (L2-normalised) now: dragon-plus HNSW/IVF navigation
+    # requires normalised vectors — raw inner product breaks the graph (the paper
+    # L2-normalises Dragon before indexing; see create_index.py). Queries must be
+    # on the same cosine scale as the doc index so s, s_max and th are consistent.
+    normalize = True
     # msmarco-on-cast searches the CAST2019 index (which already contains every
     # msmarco passage as MARCO_<n>, plus the CAR passages) using the msmarco
     # log/dev/qrels. Both msmarco modes share the parquet query loaders and the

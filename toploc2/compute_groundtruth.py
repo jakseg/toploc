@@ -70,8 +70,8 @@ def read_parquet_shard(pf, dim):
 def select_dev_queries(model_name, dataset, max_turns):
     """Dev-query ids + embeddings, restricted to ids that appear in the qrels —
     a superset of the driver's eval set, so every evaluated query has ground truth.
-    Mirrors the driver's normalize rule (dragon = raw dot product)."""
-    normalize = model_name != "dragon"
+    Mirrors the driver's normalize rule (both models cosine / L2-normalised now)."""
+    normalize = True
     qrels_path = qlr.MSMARCO_QRELS  # msmarco dev qrels (qids are model-agnostic)
     qrels = qlr.load_qrels(qrels_path)
     qids = set(qrels.keys())
@@ -98,7 +98,7 @@ def topk_stream(dev_emb, model_name, dataset, k, tile):
         print(f"ERROR: no document parquet in {emb_dir}", flush=True)
         sys.exit(1)
     dim = len(pq.read_table(shards[0], columns=["embedding"]).column("embedding")[0].as_py())
-    normalize = model_name != "dragon"
+    normalize = True  # dragon HNSW/index is cosine now (see create_index.py / driver)
     n = dev_emb.shape[0]
     print(f"Streaming {len(shards)} shards from {emb_dir} (dim={dim}, normalize={normalize}, "
           f"tile={tile})...", flush=True)
