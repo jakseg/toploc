@@ -1274,6 +1274,7 @@ def main():
     rows = []
     # carried out of the loop for the single-config detailed report below
     iq = pca = sims = visited_counts = metrics = None
+    s_max_eff = s_max            # dragon overrides this per PCA dim (see below)
     th_used = kprime_used = ef_used = None
     for pca_dim in pca_list:
         if pca_dim and pca_dim > 0:
@@ -1282,15 +1283,26 @@ def main():
             log_emb, cache_dir, model_name, dataset, args.log_limit, pca_dim,
             rebuild=args.rebuild_cache)
 
-        # Resolve th. dragon is on the raw dot-product scale, where 0.5 is
-        # meaningless, so calibrate from the actual routing-similarity distribution.
-        need_s = (model_name == "dragon" and
-                  (args.th is None or (args.sweep and not args.th_list)))
-        s_vals = routing_similarities(query_matrix, iq, args.k_prime, pca, log_emb) if need_s else None
-        if s_vals is not None:
+        # Resolve th AND the adaptive-ef anchor s_max. dragon is asymmetric (query
+        # vs context encoder): the routing similarity s (query->log-query) lives on a
+        # HIGHER scale than the paper's query->doc s_max, which then sits BELOW the
+        # entire s-distribution -> the degenerate guard (s_max<=th) in
+        # adaptive_ef_search pins ef' to ef_min and the adaptive engine NEVER engages
+        # (all routed queries get the min beam regardless of confidence). Fix: for
+        # dragon derive BOTH th and s_max from the routing-similarity distribution
+        # (the same scale as s), so th < s_max and s spans [th, s_max]. snowflake is
+        # symmetric -> keep the paper's fixed th and query->doc s_max (already work).
+        if model_name == "dragon":
+            s_vals = routing_similarities(query_matrix, iq, args.k_prime, pca, log_emb)
+            # p75 = the paper's s_max percentile, now on the routing-sim scale. The th
+            # sweep uses percentiles <= 70, so th < s_max holds by construction.
+            s_max_eff = float(np.percentile(s_vals, 75))
             print(f"  routing similarities s: min={s_vals.min():.4f} "
                   f"p25={np.percentile(s_vals, 25):.4f} median={np.median(s_vals):.4f} "
-                  f"max={s_vals.max():.4f}", flush=True)
+                  f"max={s_vals.max():.4f} | adaptive s_max<-p75={s_max_eff:.4f} "
+                  f"(paper query->doc s_max was {s_max:.4f})", flush=True)
+        else:
+            s_vals, s_max_eff = None, s_max
 
         if args.sweep:
             th_list = (_parse_float_list(args.th_list) if args.th_list else
@@ -1310,7 +1322,7 @@ def main():
                     # ADDS the single-query python/faiss passes (visited counts, the
                     # ~18 ms artifact column, a topk cross-check) — use on a small grid.
                     run, route_flags, sims, timing, routed_n = measure_qlr_latency_faithful(
-                        index, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                        index, query_matrix, eval_keys, id_map, iq, ep_table, s_max_eff,
                         k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
                         pca=pca, log_emb_full=log_emb,
                     )
@@ -1323,12 +1335,12 @@ def main():
                     if args.compare_backends:
                         (run_py, py_flags, _s, vis_py,
                          r_ms_py, f_ms_py) = build_run_qlr(
-                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max_eff,
                             k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
                             pca=pca, log_emb_full=log_emb, level0_backend="python",
                         )
                         (run_fs, _ff, _fs, _fv, r_ms_fs, _ffb) = build_run_qlr(
-                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max,
+                            index, graph, query_matrix, eval_keys, id_map, iq, ep_table, s_max_eff,
                             k=k, k_prime=k_prime, th=th, ef_default=ef, ef_min=args.ef_min,
                             pca=pca, log_emb_full=log_emb, level0_backend="faiss",
                         )
@@ -1371,7 +1383,7 @@ def main():
         for row in range(N):
             t0 = time.perf_counter()
             _, _, _, routed, _ = route(
-                query_matrix[row:row + 1], iq, ep_table, index, graph, s_max,
+                query_matrix[row:row + 1], iq, ep_table, index, graph, s_max_eff,
                 k=k, k_prime=k_prime, th=th, ef_default=ef_default, ef_min=args.ef_min,
                 pca=pca, log_emb_full=log_emb, level0_backend=args.level0_backend,
             )
@@ -1409,7 +1421,7 @@ def main():
     print("=" * 70)
     print(f"Turns evaluated: {N}  ({routed_n} routed, {fallback_n} fallback)")
     print(f"Route rate:      {routed_n / N:.1%}  (s>=th)")
-    print(f"Avg similarity:  {np.mean(sims):.4f}  (s_max={s_max:.4f}, th={th:.4f})")
+    print(f"Avg similarity:  {np.mean(sims):.4f}  (s_max={s_max_eff:.4f}, th={th:.4f})")
     print(f"NDCG@3:  {metrics['NDCG@3']:.4f}")
     print(f"NDCG@{k}: {metrics[f'NDCG@{k}']:.4f}")
     print(f"MRR@{k}:  {metrics[f'MRR@{k}']:.4f}")
