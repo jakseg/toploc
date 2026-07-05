@@ -79,13 +79,17 @@ from ir_measures import RR, nDCG
 
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
 )
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
-    "dragon": os.path.join(CACHE_BASE, "dragon"),
+    # dragon points at the preserved L2-NORMALISED (cosine) build in _cosine_old/.
+    # The index in .../dragon/ is the un-normalised dot-product build, whose HNSW
+    # graph is unnavigable (norm-bias hubs -> ~0 recall); the paper L2-normalises
+    # Dragon before indexing. Same dragon cache dir as the QLR driver.
+    "dragon": os.path.join(CACHE_BASE, "dragon", "_cosine_old"),
 }
 
 USE_MMAP = os.environ.get("MMAP", "0") == "1"
@@ -519,43 +523,69 @@ class HnswCombinedEvaluator:
         for conv_id in conversations:
             conversations[conv_id].sort(key=turn_sort_key)
 
-        # Same eval-set style as the baseline: only judged turns whose qrels survive filtering.
+        # Judged turns (evaluated for metrics) — same eval-set style as the baseline.
         eval_keys_all = [k0 for k0 in self.topics if k0 in self.filtered_qrels]
         if self.args.max_turns and self.args.max_turns > 0:
             eval_key_set = set(eval_keys_all[: self.args.max_turns])
         else:
             eval_key_set = set(eval_keys_all)
 
-        self.conv_valid = {}
+        # q0 = the conversation's FIRST UTTERANCE (paper): the true first turn in
+        # sorted order, judged or not. It anchors the TopLoc entry point and is the
+        # split point for BOTH baseline and TopLoc timing. The old code anchored on
+        # the first *judged* turn, so whenever turn 1 was unjudged a mid-conversation
+        # turn silently became q0 (wrong entry point, and a different follow-up set
+        # than the baseline). This also matches how the IVF script defines q0 (the
+        # first turn in order) — just with the sort the IVF script is missing.
+        self.conv_valid = {}        # judged turns per conversation (evaluated)
+        self.conv_first_turn = {}   # true first turn per conversation (entry-point anchor)
+        self.conv_followups = {}    # judged turns evaluated as follow-ups (all judged != q0)
         self.eval_keys = []
-        self.eval_queries = []
         for conv_id, turns in conversations.items():
             valid = [t for t in turns if t in self.filtered_qrels and t in eval_key_set]
             if not valid:
                 continue
+            q0_key = turns[0]
             self.conv_valid[conv_id] = valid
-            for t in valid:
-                self.eval_keys.append(t)
-                self.eval_queries.append(self.topics[t])
+            self.conv_first_turn[conv_id] = q0_key
+            self.conv_followups[conv_id] = [t for t in valid if t != q0_key]
+            self.eval_keys.extend(valid)
+
+        # Embeddings are needed for every judged turn (metrics) AND every q0 anchor
+        # (an unjudged first utterance is not in eval_keys but is still searched).
+        embed_keys = list(dict.fromkeys(self.eval_keys + list(self.conv_first_turn.values())))
+        self.eval_queries = [self.topics[k] for k in embed_keys]
 
         N = len(self.eval_keys)
-        print(f"Eval set: {N:,} turns across {len(self.conv_valid):,} conversations", flush=True)
-        print(f"\nObtaining query embeddings for {N:,} queries once...", flush=True)
-        query_matrix = load_precomputed_query_embeddings(self.model_name, self.eval_keys)
-        if query_matrix is None:
+        n_unjudged_q0 = sum(
+            1 for q in self.conv_first_turn.values() if q not in self.filtered_qrels
+        )
+        print(f"Eval set: {N:,} judged turns across {len(self.conv_valid):,} conversations", flush=True)
+        print(
+            f"q0 = true first utterance ({n_unjudged_q0:,} conversations have an "
+            f"unjudged q0, used as entry point only)",
+            flush=True,
+        )
+        print(f"\nObtaining query embeddings for {len(embed_keys):,} queries once...", flush=True)
+        emb_matrix = load_precomputed_query_embeddings(self.model_name, embed_keys)
+        if emb_matrix is None:
             print(f"Loading {self.model_name} query encoder...", flush=True)
             encode_batch = load_query_encoder(self.model_name)
             t0 = time.perf_counter()
-            query_matrix = encode_batch(self.eval_queries)
+            emb_matrix = encode_batch(self.eval_queries)
             enc_ms = (time.perf_counter() - t0) * 1000
             print(
                 f"Query encoding done in {enc_ms:.1f} ms total "
-                f"({enc_ms / max(N, 1):.2f} ms/query) — shape={query_matrix.shape}",
+                f"({enc_ms / max(len(embed_keys), 1):.2f} ms/query) — shape={emb_matrix.shape}",
                 flush=True,
             )
 
-        self.query_matrix = np.ascontiguousarray(query_matrix, dtype="float32")
-        self.emb_lookup = {k0: self.query_matrix[i : i + 1] for i, k0 in enumerate(self.eval_keys)}
+        emb_matrix = np.ascontiguousarray(emb_matrix, dtype="float32")
+        self.emb_lookup = {k0: emb_matrix[i : i + 1] for i, k0 in enumerate(embed_keys)}
+        # Judged-only matrix (aligned to eval_keys) for the batched baseline metrics search.
+        self.query_matrix = np.ascontiguousarray(
+            np.vstack([self.emb_lookup[k][0] for k in self.eval_keys]), dtype="float32"
+        )
 
     def _toploc_search(self, q_embs: np.ndarray, entry_points: np.ndarray, ef_search: int):
         if self.args.backend == "cpp":
@@ -584,32 +614,43 @@ class HnswCombinedEvaluator:
             dict(run),
         )
 
-        # Timing: same per-conversation style as TopLoc and IVF combined script.
-        conv_rows = []
-        key_to_row = {k0: i for i, k0 in enumerate(self.eval_keys)}
-        for conv_id, valid_turns in self.conv_valid.items():
-            rows = [key_to_row[t] for t in valid_turns]
-            conv_rows.append(rows)
-        first_n = len(conv_rows)
-        followup_n = sum(max(0, len(rows) - 1) for rows in conv_rows)
+        # Timing split MIRRORS TopLoc so the follow-up latency is apples-to-apples:
+        # per conversation, q0 = the true first turn (the entry-point anchor there) is
+        # the "first turn", and the judged turns after it are the follow-ups — the same
+        # q0 and the same follow-up set as eval_toploc.
+        conv_ids = list(self.conv_valid.keys())
+        first_n = len(conv_ids)
+        followup_n = sum(len(self.conv_followups[c]) for c in conv_ids)
 
-        # All follow-up rows across all conversations, flattened once.
-        all_fu_rows = [r for rows in conv_rows for r in rows[1:]]
-        all_fu_matrix = (
-            np.ascontiguousarray(self.query_matrix[all_fu_rows], dtype="float32")
-            if all_fu_rows
+        first_matrix = (
+            np.ascontiguousarray(
+                np.vstack([self.emb_lookup[self.conv_first_turn[c]][0] for c in conv_ids]),
+                dtype="float32",
+            )
+            if conv_ids
             else None
         )
-        first_rows = [rows[0] for rows in conv_rows]
+        # Follow-up rows flattened once; per-conversation lengths let the correctness-only
+        # kernels keep their per-conversation batching.
+        fu_lens = [len(self.conv_followups[c]) for c in conv_ids]
+        all_fu_keys = [t for c in conv_ids for t in self.conv_followups[c]]
+        all_fu_matrix = (
+            np.ascontiguousarray(
+                np.vstack([self.emb_lookup[t][0] for t in all_fu_keys]), dtype="float32"
+            )
+            if all_fu_keys
+            else None
+        )
 
         def sweep():
             first_ms = 0.0
             followup_ms = 0.0
             # First turns: searched one at a time (q0 always runs alone in TopLoc too).
-            for q0_row in first_rows:
-                t0 = time.perf_counter()
-                self.index.search(self.query_matrix[q0_row : q0_row + 1], self.k)
-                first_ms += (time.perf_counter() - t0) * 1000
+            if first_matrix is not None:
+                for r in range(first_matrix.shape[0]):
+                    t0 = time.perf_counter()
+                    self.index.search(first_matrix[r : r + 1], self.k)
+                    first_ms += (time.perf_counter() - t0) * 1000
             # Follow-ups. With the faiss backend, ALL follow-ups go in ONE batched
             # search so the plain-HNSW VisitedTable(ntotal) is amortized exactly the
             # same way as TopLoc's batched search_level_0 — the fair, single-thread
@@ -621,12 +662,13 @@ class HnswCombinedEvaluator:
                     self.index.search(all_fu_matrix, self.k)
                     followup_ms += (time.perf_counter() - t0) * 1000
                 else:
-                    for rows in conv_rows:
-                        if len(rows) > 1:
-                            fu_rows = rows[1:]
+                    offset = 0
+                    for n in fu_lens:
+                        if n:
                             t0 = time.perf_counter()
-                            self.index.search(self.query_matrix[fu_rows], self.k)
+                            self.index.search(all_fu_matrix[offset : offset + n], self.k)
                             followup_ms += (time.perf_counter() - t0) * 1000
+                        offset += n
             return first_ms, followup_ms
 
         for _ in range(BATCH_WARMUP_RUNS):
@@ -640,7 +682,8 @@ class HnswCombinedEvaluator:
         f_mean = latency_stats(first_times)[2]
         u_mean = latency_stats(followup_times)[2]
         fu_pq = u_mean / followup_n if followup_n else float("nan")
-        overall_pq = (f_mean + u_mean) / len(self.eval_keys) if self.eval_keys else float("nan")
+        denom = first_n + followup_n
+        overall_pq = (f_mean + u_mean) / denom if denom else float("nan")
         return metrics, fu_pq, overall_pq, first_n, followup_n
 
     def eval_toploc(self, ef_search: int, up: int, entry_points_n: int):
@@ -661,8 +704,8 @@ class HnswCombinedEvaluator:
         fu_eps_flat: List[np.ndarray] = []
         visited_counts = []
 
-        for conv_i, (conv_id, valid_turns) in enumerate(self.conv_valid.items(), start=1):
-            q0_key = valid_turns[0]
+        for conv_i, conv_id in enumerate(self.conv_valid, start=1):
+            q0_key = self.conv_first_turn[conv_id]   # true first utterance (paper q0)
             q0_emb = self.emb_lookup[q0_key]
 
             self.index.hnsw.efSearch = ef_search * up
@@ -678,9 +721,12 @@ class HnswCombinedEvaluator:
 
             conv_q0_emb[conv_id] = q0_emb
             conv_entry_points[conv_id] = eps
-            add_to_run(run, q0_key, q0_scores[0][:k], q0_indices[0][:k], self.id_map)
+            # Score q0 into the run only when it is a judged turn; an unjudged first
+            # utterance is an entry-point anchor only, never evaluated.
+            if q0_key in self.filtered_qrels:
+                add_to_run(run, q0_key, q0_scores[0][:k], q0_indices[0][:k], self.id_map)
 
-            followup_keys = valid_turns[1:]
+            followup_keys = self.conv_followups[conv_id]
             if followup_keys:
                 fu_embs = np.vstack([self.emb_lookup[t] for t in followup_keys]).astype("float32")
                 conv_fu_keys[conv_id] = followup_keys
@@ -776,8 +822,14 @@ def parse_args():
     parser.add_argument("--up", type=int, default=int(os.environ.get("UP", 2)))
     parser.add_argument(
         "--up-values",
+        nargs="?",
+        const="2,4,8,16",
         default=None,
-        help="Optional comma-list for TopLoc-HNSW up sweep, e.g. --up-values 2,4,8,16",
+        help=(
+            "Sweep TopLoc-HNSW `up` (the q0 efSearch multiplier). Bare flag = the "
+            "paper grid 2,4,8,16; or a comma-list, e.g. --up-values 2,4,8. During a "
+            "--sweep the up grid defaults to 2,4,8,16 unless pinned here."
+        ),
     )
     parser.add_argument("--entry-points", type=int, default=int(os.environ.get("ENTRY_POINTS", 1)))
     parser.add_argument("--k", type=int, default=int(os.environ.get("K", 10)))
@@ -797,7 +849,7 @@ def parse_args():
     parser.add_argument(
         "--sweep",
         nargs="?",
-        const="1,2,4,8,16,32,64,128,256,512,1024",
+        const="1,2,4,8,16,32,64,128,256,512,1024,2048,4096",
         help="Sweep efSearch values. Optional comma-list, e.g. --sweep 16,32,64,128",
     )
     args = parser.parse_args()
@@ -806,9 +858,11 @@ def parse_args():
     if args.sweep is not None:
         args.sweep_values = [int(x.strip()) for x in args.sweep.split(",") if x.strip()]
 
-    args.up_values = None
     if args.up_values is not None:
         args.up_values = [int(x.strip()) for x in args.up_values.split(",") if x.strip()]
+    elif args.sweep_values:
+        # A full efSearch sweep also sweeps the paper `up` grid by default.
+        args.up_values = [2, 4, 8, 16]
 
     return args
 
