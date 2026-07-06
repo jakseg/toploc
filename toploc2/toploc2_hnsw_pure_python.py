@@ -1305,9 +1305,17 @@ def main():
             s_vals, s_max_eff = None, s_max
 
         if args.sweep:
-            th_list = (_parse_float_list(args.th_list) if args.th_list else
-                       ([round(float(np.percentile(s_vals, p)), 4) for p in (10, 25, 40, 55, 70)]
-                        if model_name == "dragon" else [0.3, 0.4, 0.5, 0.6, 0.7]))
+            # Paper threshold grid {0.3..0.7}. Dragon is L2-normalised (cosine) like
+            # the paper's normalised encoders, so it uses the SAME grid as snowflake
+            # (the Contriever {1.2..1.6} grid is for the un-normalised case and would
+            # never route here, since cosine <= 1.0). NB: dragon's routing similarities
+            # (query->log-query) sit high (~0.7-0.95, asymmetric query/context encoders),
+            # so with this fixed grid almost every query routes (route_rate ~1.0); the
+            # adaptive ef' still varies with th via the recalibrated s_max_eff. The
+            # data-driven percentile grid (which spreads route_rate) is available via
+            # --th-list if a non-degenerate routing sweep is wanted.
+            th_list = (_parse_float_list(args.th_list) if args.th_list
+                       else [0.3, 0.4, 0.5, 0.6, 0.7])
         else:
             th_resolved = (args.th if args.th is not None else
                            (float(np.percentile(s_vals, 25)) if model_name == "dragon" else 0.5))
