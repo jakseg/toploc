@@ -1025,9 +1025,8 @@ def main():
     parser.add_argument("--th", type=float,
                         default=(float(os.environ["TH"]) if os.environ.get("TH") else None),
                         help="similarity threshold; below it the query is not routed. "
-                             "Set -> absolute th paired with the paper query->doc s_max; "
-                             "unset -> data-driven (25th pct of the routing similarities) "
-                             "paired with the routing-p75 s_max (model-agnostic).")
+                             "Unset -> 0.5 for snowflake (cosine); data-driven for dragon "
+                             "(25th pct of the routing similarities).")
     parser.add_argument("--ef-default", type=int, default=int(os.environ.get("EF_DEFAULT", 100)),
                         help="upper bound of adaptive ef' and the fallback efSearch")
     parser.add_argument("--ef-min", type=int, default=int(os.environ.get("EF_MIN", 10)),
@@ -1050,15 +1049,9 @@ def main():
     parser.add_argument("--sweep", action="store_true",
                         help="sweep hyperparameters, building EP/s_max (and I_Q per PCA) once")
     parser.add_argument("--th-list", default=os.environ.get("TH_LIST", ""),
-                        help="comma th values for --sweep (default: paper grid / dragon pct grid)")
-    parser.add_argument("--th-mode", choices=["basic", "data-driven", "both"],
-                        default=os.environ.get("TH_MODE", "basic"),
-                        help="--sweep threshold grid: basic (paper {0.3..0.7} / --th-list), "
-                             "data-driven (percentiles of the routing-sim distribution, the "
-                             "pre-cf41132 dragon grid), or both (ONE csv, tagged via th_mode; "
-                             "baseline built once, shared)")
+                        help="comma th values for the --sweep paper (basic) grid (default 0.3..0.7)")
     parser.add_argument("--th-pct-list", default=os.environ.get("TH_PCT_LIST", ""),
-                        help="percentiles for --th-mode data-driven/both (default 10,25,40,55,70)")
+                        help="percentiles for dragon's data-driven --sweep grid (default 10,25,40,55,70)")
     parser.add_argument("--kprime-list", default=os.environ.get("KPRIME_LIST", ""),
                         help="comma k' values for --sweep (default: 10,20)")
     parser.add_argument("--ef-list", default=os.environ.get("EF_LIST", ""),
@@ -1284,7 +1277,7 @@ def main():
     rows = []
     # carried out of the loop for the single-config detailed report below
     iq = pca = sims = visited_counts = metrics = None
-    s_max_eff = s_max            # per-(th_mode) anchor set inside the loop (see below)
+    s_max_eff = s_max            # dragon overrides this per PCA dim (routing p75)
     th_used = kprime_used = ef_used = None
     for pca_dim in pca_list:
         if pca_dim and pca_dim > 0:
@@ -1293,41 +1286,36 @@ def main():
             log_emb, cache_dir, model_name, dataset, args.log_limit, pca_dim,
             rebuild=args.rebuild_cache)
 
-        # The adaptive-ef reference similarity s_max is chosen by the th SCALE, not by
-        # the model (no `if dragon`): an ABSOLUTE th (paper grid) pairs with the paper's
-        # query->doc s_max; a DATA-DRIVEN th (percentiles of the routing-sim distribution)
-        # pairs with the p75 of that SAME distribution. So th and s_max always share one
-        # scale, the adaptive-ef guard (s_max>th) holds, and the engine engages for ANY
-        # encoder. This is exactly why dragon needs the data-driven pairing and snowflake
-        # does not: dragon's routing sims (query->log-query, ~0.68-0.95, asymmetric
-        # encoders) sit ABOVE its query->doc s_max (~0.57), so the paper's absolute-th +
-        # query->doc-s_max pairing degenerates ef'->ef_min; snowflake is symmetric so the
-        # paper pairing already spans [th, s_max]. Routing sims are computed once per PCA
-        # dim, only when a data-driven grid is requested -> basic-only runs skip the cost.
-        need_routing = ((args.th_mode in ("data-driven", "both")) if args.sweep
-                        else args.th is None)
-        s_vals = (routing_similarities(query_matrix, iq, args.k_prime, pca, log_emb)
-                  if need_routing else None)
-        s_max_paper = s_max                                       # paper query->doc anchor
-        s_max_routing = float(np.percentile(s_vals, 75)) if s_vals is not None else None
-        if s_vals is not None:
+        # Resolve the adaptive-ef anchor s_max PER MODEL (not per th_mode). dragon is
+        # asymmetric (query vs context encoder): the routing similarity s
+        # (query->log-query, ~0.68-0.95) lives on a HIGHER scale than the paper's
+        # query->doc s_max (~0.57), which then sits BELOW the whole s-distribution ->
+        # the degenerate guard (s_max<=th) in adaptive_ef_search pins ef' to ef_min and
+        # the adaptive engine NEVER engages. Fix: for dragon anchor s_max on the
+        # routing-sim distribution (p75, same scale as s). snowflake is symmetric ->
+        # keep the paper's fixed query->doc s_max (already works). The data-driven
+        # threshold is a DRAGON-ONLY tool for the same reason; snowflake uses the paper
+        # grid. This is deliberately NOT generalised to snowflake (that broke it).
+        if model_name == "dragon":
+            s_vals = routing_similarities(query_matrix, iq, args.k_prime, pca, log_emb)
+            s_max_eff = float(np.percentile(s_vals, 75))
             print(f"  routing similarities s: min={s_vals.min():.4f} "
                   f"p25={np.percentile(s_vals, 25):.4f} median={np.median(s_vals):.4f} "
-                  f"max={s_vals.max():.4f} | s_max paper(query->doc)={s_max_paper:.4f} "
-                  f"data-driven(p75)={s_max_routing:.4f}", flush=True)
+                  f"max={s_vals.max():.4f} | adaptive s_max<-p75={s_max_eff:.4f} "
+                  f"(paper query->doc s_max was {s_max:.4f})", flush=True)
+        else:
+            s_vals, s_max_eff = None, s_max
 
+        # th_specs = list of (th, th_mode). basic = paper grid {0.3..0.7} (or --th-list),
+        # for both models. data-driven = percentiles of dragon's routing-sim
+        # distribution (spreads the route rate) — DRAGON ONLY. In a --sweep both grids
+        # are emitted into ONE csv, tagged by the th_mode column (baseline built once,
+        # shared), so a single dragon run gives baseline + paper sweep + data-driven.
         if args.sweep:
-            # th_specs = list of (th, th_mode); --th-mode selects the grid(s). basic +
-            # data-driven can run in ONE sweep (baseline built once -> shared) and stay
-            # distinguishable via the th_mode column. basic = paper grid {0.3..0.7} (or
-            # --th-list); data-driven = percentiles of the routing-sim distribution (the
-            # pre-cf41132 grid) -> spreads the route rate.
             basic_grid = (_parse_float_list(args.th_list) if args.th_list
                           else [0.3, 0.4, 0.5, 0.6, 0.7])
-            th_specs = []
-            if args.th_mode in ("basic", "both"):
-                th_specs += [(t, "basic") for t in basic_grid]
-            if args.th_mode in ("data-driven", "both"):
+            th_specs = [(t, "basic") for t in basic_grid]
+            if model_name == "dragon":
                 pcts = (_parse_float_list(args.th_pct_list) if args.th_pct_list
                         else [10, 25, 40, 55, 70])
                 th_specs += [(round(float(np.percentile(s_vals, p)), 4), "data-driven")
@@ -1335,14 +1323,10 @@ def main():
         elif args.th is not None:
             th_specs = [(args.th, "basic")]                       # explicit absolute th
         else:
-            th_specs = [(float(np.percentile(s_vals, 25)), "data-driven")]  # default: data-driven
-
-        # s_max anchor is picked per th scale (set at the top of the th loop below).
-        def _anchor(th_mode):
-            return s_max_routing if th_mode == "data-driven" else s_max_paper
+            th_specs = ([(float(np.percentile(s_vals, 25)), "data-driven")]
+                        if model_name == "dragon" else [(0.5, "basic")])
 
         for th, th_mode in th_specs:
-            s_max_eff = _anchor(th_mode)
             for k_prime in kprime_list:
                 for ef in ef_list:
                     # Primary = paper-faithful batched latency (VisitedTable amortized,
