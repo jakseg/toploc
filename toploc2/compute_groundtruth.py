@@ -141,7 +141,7 @@ def topk_stream(dev_emb, model_name, dataset, k, tile):
 
 def topk_exact_index(dev_emb, model_name, dataset, k):
     """Exact top-k via the prebuilt exact IndexFlatIP (+ its ids)."""
-    cache_dir = (qlr.MSMARCO_CACHE_DIRS if dataset == "msmarco" else qlr.CACHE_DIRS)[model_name]
+    cache_dir = qlr.CACHE_DIRS[model_name]
     index_path = os.path.join(cache_dir, "exact_index.index")
     ids_path = os.path.join(cache_dir, "exact_ids.npy")
     if not (os.path.exists(index_path) and os.path.exists(ids_path)):
@@ -176,7 +176,7 @@ def main():
 
     gt = {qid: [p for p in gt_pids[i].tolist() if p] for i, qid in enumerate(dev_ids)}
 
-    cache_dir = (qlr.MSMARCO_CACHE_DIRS if args.dataset == "msmarco" else qlr.CACHE_DIRS)[args.model]
+    cache_dir = qlr.CACHE_DIRS[args.model]
     out_path = qlr.groundtruth_path(cache_dir, args.model, args.dataset, args.k)
     os.makedirs(cache_dir, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
