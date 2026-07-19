@@ -24,7 +24,7 @@ Outputs are saved to `data/snowflake/` and `data/dragon/` respectively.
 ### 2. Build Index
 
 ```bash
-python create_index.py <model> <index_type> [dataset]
+python create_index.py <model> <index_type> [dataset] [--param value ...]
 ```
 
 - `model`: `snowflake` or `dragon`
@@ -38,6 +38,38 @@ python create_index.py snowflake ivf            # CAST2019 (default)
 python create_index.py snowflake exact,ivf      # build two sequentially
 python create_index.py snowflake all            # exact + ivf + hnsw
 python create_index.py snowflake hnsw msmarco   # QLR document index (msmarco)
+```
+
+#### Choosing the index parameters
+
+Every index parameter is exposed as an optional flag. **Omit a flag and the build
+uses the paper-faithful per-model / per-dataset default**, so the positional-only form
+above reproduces the paper. Pass a flag to override it. The values tested in the two
+papers are listed with `python create_index.py --help`; the same grid in short:
+
+| Flag | Applies to | Paper values | Default |
+|------|-----------|--------------|---------|
+| `--num-centroids` | IVF | `{32768, 65536, 131072, 262144}` = 2¹⁵–2¹⁸ (TopLoc) | dragon 262144, snowflake 32768 |
+| `--nprobe` | IVF | 1…4096 in powers of 2 (TopLoc) | 128 |
+| `--kmeans-niter` | IVF | 25 (FAISS default), 10 (project) | 25 |
+| `--train-sample-size` | IVF | ≥ 39 × `num_centroids` (FAISS heuristic) | auto (≥ 40 × centroids) |
+| `--M` | HNSW | `{16, 32, 64}` (TopLoc); 32 (QLR) | 32 |
+| `--ef-construction` | HNSW | 500 (QLR); 200 (project default) | 200 (cast2019) / 500 (msmarco) |
+| `--ef-search` | HNSW | 1…4096 pow2 (TopLoc); 10…200 step 10 (QLR) | 64 |
+| `--normalize / --no-normalize` | both | Dragon L2-normalized for cosine (TopLoc) | `--normalize` |
+
+`--nprobe` and `--ef-search` are search-time knobs baked into the saved index as
+defaults; the evaluation scripts sweep them. Keep `--normalize` on: an un-normalized
+HNSW/IVF graph on Dragon degenerates (norm-bias hubs → ~0 recall).
+
+Examples:
+```bash
+# reproduce the paper build (no flags needed)
+python create_index.py dragon ivf                                   # 2^18 centroids
+python create_index.py snowflake ivf                                # 2^15 centroids
+# pick your own parameters
+python create_index.py dragon ivf  --num-centroids 131072 --kmeans-niter 10
+python create_index.py snowflake hnsw --M 64 --ef-construction 500
 ```
 
 The build streams embeddings from parquet and checkpoints every 50 files

@@ -3,6 +3,8 @@ import os
 import gc
 import glob
 import random
+import argparse
+import textwrap
 import faiss
 import numpy as np
 import json
@@ -92,7 +94,9 @@ def setup_logger(log_path):
 
 
 # ================= BUILD ONE INDEX =================
-def build_index(model_name, index_type, parquet_files, dim, cache_dir):
+def build_index(model_name, index_type, parquet_files, dim, cache_dir,
+                kmeans_niter=25, train_sample_size=None, normalize=True,
+                overridden_flags=None):
     log_path = os.path.join(cache_dir, f"{index_type}_indexCreation.log")
     log = setup_logger(log_path)
 
@@ -106,8 +110,18 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
     # product (norm-bias hubs -> greedy search unreachable -> ~0 recall, while
     # exact is unaffected). The toploc1 paper L2-normalizes Dragon before indexing
     # for exactly this reason. Keep all index types on the same cosine scale.
-    normalize_vecs = True
+    normalize_vecs = normalize
     log.info(f"[{index_type}] normalize_L2={normalize_vecs} (model={model_name})")
+
+    # The filename ({index_type}_index.index) does NOT encode the parameters, so a
+    # rebuild with different parameters reuses the same path. If an index for this
+    # type already exists it is reused (resumed or skipped) and any parameter flags
+    # are IGNORED -- delete the 3 artifacts first to actually rebuild with new params.
+    def warn_params_ignored(state):
+        if overridden_flags:
+            log.warning(f"[{index_type}] {state} an existing index -> the parameter flags "
+                        f"{overridden_flags} are IGNORED. To rebuild with them, delete: "
+                        f"{index_path} , {ids_path} , {checkpoint_path}")
 
     # Resume or init
     start_file = 0
@@ -120,10 +134,12 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
         start_file = ckpt["last_file_index"] + 1
         all_ids = list(np.load(ids_path, allow_pickle=True))
         index = faiss.read_index(index_path)
+        warn_params_ignored("resuming")
         log.info(f"[{index_type}] Resuming from file {start_file}/{len(parquet_files)}, "
                  f"index has {index.ntotal:,} vectors")
 
     elif os.path.exists(index_path) and not os.path.exists(checkpoint_path):
+        warn_params_ignored("skipping")
         log.info(f"[{index_type}] Final index already exists at {index_path}, skipping.")
         index = faiss.read_index(index_path)
         log.info(f"[{index_type}] Stats: ntotal={index.ntotal:,}, trained={index.is_trained}")
@@ -140,7 +156,7 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
             # centroids. Scale the sample to the codebook size so large ones
             # (Dragon 2^18 -> ~10.5M) are not starved, while small ones
             # (Snowflake 2^15) stay at the 2M floor.
-            train_target = max(TRAIN_SAMPLE_SIZE, 40 * num_centroids)
+            train_target = train_sample_size if train_sample_size else max(TRAIN_SAMPLE_SIZE, 40 * num_centroids)
             log.info(f"[ivf] Collecting training sample (target {train_target:,} vectors)...")
             shuffled = list(parquet_files)
             random.shuffle(shuffled)
@@ -157,8 +173,8 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
             train_data = np.concatenate(train_chunks)[:train_target]
             del train_chunks
             # Show k-means progress (otherwise train() is silent for hours) and
-            # allow cutting the iteration count via KMEANS_NITER (default 25).
-            index.cp.niter = int(os.environ.get("KMEANS_NITER", 25))
+            # allow cutting the iteration count via --kmeans-niter (default 25).
+            index.cp.niter = kmeans_niter
             index.cp.verbose = True
             log.info(f"[ivf] Training on {len(train_data):,} vectors "
                      f"(FAISS needs >= {39 * num_centroids:,}), niter={index.cp.niter}...")
@@ -233,14 +249,51 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir):
 
 
 # ================= MAIN =================
-# Usage: create_index.py <model> <index_type> [dataset]   (dataset default cast2019)
-model_name = sys.argv[1] if len(sys.argv) > 1 else "snowflake"
-type_arg = sys.argv[2] if len(sys.argv) > 2 else "ivf"
-dataset = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("DATASET", "cast2019")
+# Every index parameter is exposed as an optional flag. When a flag is omitted the
+# build falls back to the paper-faithful per-model / per-dataset default, so the
+# positional-only form still reproduces the paper. The flag values tested in the
+# two papers are listed in the --help epilog below.
+PARAM_HELP = textwrap.dedent("""\
+    Paper parameter grids (pick --flag values from these to reproduce the papers):
 
-if dataset not in DATASETS:
-    print(f"Unknown dataset: {dataset}. Use one of {tuple(DATASETS)}.")
-    sys.exit(1)
+      IVF   --num-centroids     {32768, 65536, 131072, 262144} = 2^15..2^18   [TopLoc]
+                                best: dragon 262144 (2^18), snowflake 32768 (2^15)
+            --nprobe            1..4096 in powers of 2 (search-time; baked into the index) [TopLoc]
+            --kmeans-niter      25 (FAISS default) | 10 (project: 2.5x faster coarse quantizer)
+            --train-sample-size FAISS needs >= 39 * num_centroids well-formed centroids
+      HNSW  --M                 {16, 32, 64} [TopLoc]; 32 [QLR]
+            --ef-construction   500 [QLR]; 200 (project default; TopLoc leaves it unspecified)
+            --ef-search         1..4096 pow2 [TopLoc]; 10..200 step 10 [QLR] (search-time; baked in)
+      both  --normalize / --no-normalize   cosine vs raw dot product
+                                (the paper L2-normalizes Dragon for HNSW/IVF -> keep normalize on;
+                                 --no-normalize degenerates the graph, ~0 recall)
+
+    Any numeric value is accepted; the lists above are only what the papers tested.
+    """)
+
+parser = argparse.ArgumentParser(
+    description="Build FAISS indexes (exact / ivf / hnsw) for the TopLoc + QLR reproduction.",
+    epilog=PARAM_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("model", nargs="?", default="snowflake", choices=["snowflake", "dragon"])
+parser.add_argument("index_type", nargs="?", default="ivf",
+                    help="exact | ivf | hnsw | comma-list (e.g. exact,ivf) | all")
+parser.add_argument("dataset", nargs="?", default=os.environ.get("DATASET", "cast2019"),
+                    choices=list(DATASETS), help="cast2019 (default) | msmarco")
+g = parser.add_argument_group("index parameters (override the paper-faithful defaults)")
+g.add_argument("--num-centroids", type=int, default=None, help="IVF: number of k-means centroids")
+g.add_argument("--nprobe", type=int, default=None, help="IVF: lists probed at search time")
+g.add_argument("--M", type=int, default=None, help="HNSW: graph degree (edges per node)")
+g.add_argument("--ef-construction", type=int, default=None, help="HNSW: build-time beam width")
+g.add_argument("--ef-search", type=int, default=None, help="HNSW: search-time beam width")
+g.add_argument("--kmeans-niter", type=int, default=None, help="IVF: k-means iterations")
+g.add_argument("--train-sample-size", type=int, default=None, help="IVF: number of k-means training vectors")
+g.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True,
+               help="L2-normalize vectors for cosine (default); --no-normalize for raw dot product")
+args = parser.parse_args()
+
+model_name = args.model
+type_arg = args.index_type
+dataset = args.dataset
 
 if type_arg == "all":
     index_types = list(VALID_INDEX_TYPES)
@@ -256,19 +309,49 @@ emb_dir = os.path.join(ds["embeddings_base"], ds["emb_subdir"][model_name])
 cache_dir = os.path.join(ds["cache_base"], model_name)
 os.makedirs(cache_dir, exist_ok=True)
 
-# Dataset-specific HNSW build quality (QLR paper uses 500; CAST used 200).
+# Dataset-specific HNSW build quality (QLR paper uses 500; CAST used 200). Applied
+# before the CLI overrides so an explicit --ef-construction still wins.
 for m in INDEX_PARAMS:
     if "hnsw" in INDEX_PARAMS[m]:
         INDEX_PARAMS[m]["hnsw"]["ef_construction"] = ds["hnsw_ef_construction"]
 
+# CLI overrides on top of the per-model / per-dataset defaults (only when provided).
+if args.num_centroids is not None:
+    INDEX_PARAMS[model_name].setdefault("ivf", {})["num_centroids"] = args.num_centroids
+if args.nprobe is not None:
+    INDEX_PARAMS[model_name].setdefault("ivf", {})["nprobe"] = args.nprobe
+if args.M is not None:
+    INDEX_PARAMS[model_name].setdefault("hnsw", {})["M"] = args.M
+if args.ef_construction is not None:
+    INDEX_PARAMS[model_name].setdefault("hnsw", {})["ef_construction"] = args.ef_construction
+if args.ef_search is not None:
+    INDEX_PARAMS[model_name].setdefault("hnsw", {})["ef_search"] = args.ef_search
+
+kmeans_niter = args.kmeans_niter if args.kmeans_niter is not None else int(os.environ.get("KMEANS_NITER", 25))
+
+# Which parameter flags the user set explicitly (for the "ignored on skip" warning).
+overridden_flags = [name for name, val in [
+    ("--num-centroids", args.num_centroids), ("--nprobe", args.nprobe), ("--M", args.M),
+    ("--ef-construction", args.ef_construction), ("--ef-search", args.ef_search),
+    ("--kmeans-niter", args.kmeans_niter), ("--train-sample-size", args.train_sample_size),
+] if val is not None]
+if not args.normalize:
+    overridden_flags.append("--no-normalize")
+
 parquet_files, dim = get_parquet_info(emb_dir)
 print(f"Dataset: {dataset} | Model: {model_name} | Types: {index_types} | "
       f"{len(parquet_files)} parquet files, dim={dim} | cache={cache_dir}")
+print(f"Params: normalize={args.normalize} | kmeans_niter={kmeans_niter} | "
+      f"train_sample={args.train_sample_size or 'auto (>= 40 x centroids)'}")
+print(f"        IVF={INDEX_PARAMS[model_name].get('ivf', {})} | "
+      f"HNSW={INDEX_PARAMS[model_name].get('hnsw', {})}")
 
 for it in index_types:
     print(f"\n{'=' * 60}\nBuilding: {it}\n{'=' * 60}")
     t0 = time.time()
-    build_index(model_name, it, parquet_files, dim, cache_dir)
+    build_index(model_name, it, parquet_files, dim, cache_dir,
+                kmeans_niter=kmeans_niter, train_sample_size=args.train_sample_size,
+                normalize=args.normalize, overridden_flags=overridden_flags)
     print(f"[{it}] total wall time: {(time.time() - t0) / 60:.1f} min")
     gc.collect()
 
