@@ -34,12 +34,12 @@ I_D (it already contains every msmarco passage as MARCO_<n>), with the msmarco
 train split as Q_L and the msmarco dev queries + qrels.dev.small as the test set.
 
 Run examples:
-    python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast
+    python -u qlr.py snowflake --dataset msmarco-on-cast
     # plain-HNSW baseline curve (sweep ef-search):
-    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+    MMAP=1 python -u qlr.py snowflake --dataset msmarco-on-cast \
         --mode baseline --sweep
     # full QLR sweep (th x k' x ef x PCA), capped log for a quick run:
-    MMAP=1 python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+    MMAP=1 python -u qlr.py snowflake --dataset msmarco-on-cast \
         --sweep --log-limit 100000
 """
 

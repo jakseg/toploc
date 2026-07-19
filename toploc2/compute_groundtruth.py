@@ -6,7 +6,7 @@ the paper's Accuracy@10 metric (fraction of the true top-k retrieved).
 Run this ONCE per (model, dataset). It loads only the document embeddings (or the
 exact IndexFlatIP), NOT the big HNSW index, so it does not compete for RAM with a
 QLR/baseline run. The result is a small JSON map {dev_query_id: [pid, ...]} that
-toploc2_hnsw_pure_python.py picks up automatically to report Accuracy@k.
+qlr.py picks up automatically to report Accuracy@k.
 
 Two methods:
   --method stream   (default) stream the document-embedding parquet shards in
@@ -35,7 +35,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import faiss
 
-import toploc2_hnsw_pure_python as qlr  # path constants + loaders (import-safe)
+import qlr  # path constants + loaders (import-safe)
 
 # Document-embedding collections, mirroring create_index.py's DATASETS. msmarco-on-cast
 # searches the CAST2019 collection (its HNSW index is I_D), so it reuses cast2019.

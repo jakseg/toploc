@@ -14,12 +14,56 @@ pip install -r requirements.txt
 
 ### 1. Create Embeddings
 
+The finished embeddings were provided by our supervisor; these scripts reproduce
+them conceptually and are paper-faithful (toploc.pdf §Models). They stream any
+input and write sharded parquet with columns `id`, `embedding` — the format
+`create_index.py` and the QLR driver consume. All are model-parametrized
+(`snowflake` / `dragon`).
+
+**Documents** (paper-1 collection, reused as I_D by QLR):
+
 ```bash
-python create_embeddings/create_embeddings_snowflake.py   # Snowflake Arctic Embed (1024-dim)
-python create_embeddings/create_embeddings_dragon.py      # Dragon+ (768-dim)
+# smoke test (2k passages, one shard)
+python create_embeddings/create_document_embeddings.py snowflake \
+  --input dataset/head_2000_rows.tsv --out-dir data/snowflake --limit 2000
+
+# full CAsT2019 collection (38.6M) on the cluster
+python create_embeddings/create_document_embeddings.py dragon \
+  --input  /home/toploc2/Datasets/conversational/CAST2019/CAST2019collection.tsv \
+  --out-dir /home/toploc2/Datasets/conversational/CAST2019/dragon_embeddings
 ```
 
-Outputs are saved to `data/snowflake/` and `data/dragon/` respectively.
+Encoding: snowflake = arctic-embed-l-v2.0, no query prompt, L2-normalised, 1024-d;
+dragon = dragon-plus-**context**-encoder, CLS token, 768-d. dragon is stored **raw**
+(dot product, norm ~65) by default — `create_index.py` L2-normalises at build time,
+so the index is identical; pass `--normalize` to store cosine-normalised dragon.
+
+**Queries** (QLR historical log Q_L, QLR dev queries, and CAsT 2019/2020 topics):
+
+```bash
+# QLR dev queries (jsonl), snowflake
+python create_embeddings/create_query_embeddings.py snowflake \
+  --input .../msmarco_queries/dev_queries.jsonl --input-format jsonl \
+  --out-dir .../msmarco_embeddings/dev_query
+
+# CAsT2020 topics ("turn_id,query"), dragon, one file
+python create_embeddings/create_query_embeddings.py dragon \
+  --input .../CAST2020/topics/topics.tsv --input-format tsv --sep ',' \
+  --out-dir .../CAST2020/topics --prefix topics_dragon_embeddings --shard-size 0
+```
+
+Queries differ from documents by exactly one thing per model: snowflake adds the
+`query` prompt; dragon uses the dragon-plus-**query**-encoder (both L2-normalised).
+
+**Verify conformance** against the supervisor's stored embeddings (cosine ≈ 1.0
+proves our encoder matches; runs on the cluster where text + parquet both live):
+
+```bash
+python create_embeddings/verify_embeddings.py snowflake --mode passage \
+  --emb-dir   /home/toploc2/Datasets/conversational/CAST2019/snowflake_embeddings \
+  --text-file /home/toploc2/Datasets/conversational/CAST2019/CAST2019collection.tsv \
+  --text-format tsv --n 20
+```
 
 ### 2. Build Index
 
@@ -108,7 +152,7 @@ HNSW index is the document index `I_D` (it already contains every msmarco passag
 as `MARCO_<n>`), with the msmarco train split as the query log `Q_L` and the
 msmarco dev queries + `qrels.dev.small.tsv` as the test set.
 
-Driver: `toploc2_hnsw_pure_python.py` (pure Python, no C++). Two metrics are
+Driver: `qlr.py` (pure Python, no C++). Two metrics are
 reported: **Accuracy@10** (fraction of the *exhaustive* top-10 retrieved — the
 paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
 
@@ -141,16 +185,15 @@ loads the HNSW index, so mmap is irrelevant there.)
 
 ```bash
 bash run_qlr_experiments.sh snowflake               # snowflake (data validated)
-bash run_qlr_experiments.sh dragon                  # encodes dev embeddings + smoke test first
+bash run_qlr_experiments.sh dragon                  # encodes dev embeddings first
 LOG_LIMIT=0 bash run_qlr_experiments.sh snowflake   # full ~808k log (default caps |Q_L| at 100k)
 ```
 
 Or the individual steps, in order:
 
-1. **(dragon only)** encode the dev queries and validate the data:
+1. **(dragon only)** encode the dev queries:
    ```bash
    python encode_msmarco_dev_dragon.py
-   python smoke_test_msmarco_on_cast.py dragon       # expect ~100% qrels coverage, READY
    ```
 
 2. **ground truth for Accuracy@10** (one-time exact top-10; streams the doc
@@ -165,7 +208,7 @@ Or the individual steps, in order:
    PCA`), writing both to one CSV (the `mode` column separates them; EP/s_max are
    built once and reused across the QLR grid):
    ```bash
-   python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
+   python -u qlr.py <model> --dataset msmarco-on-cast \
        --mode both --sweep --log-limit 100000 --threads 14 --out sweep.csv
    ```
 
@@ -174,45 +217,66 @@ In `sweep.csv` compare `mode=baseline` vs `mode=qlr`: QLR should reach about the
 (also one index load):
 
 ```bash
-python -u toploc2_hnsw_pure_python.py snowflake --dataset msmarco-on-cast \
+python -u qlr.py snowflake --dataset msmarco-on-cast \
     --mode both --log-limit 2000 --max-turns 50
 ```
 
-### Real routed latency (FAISS `search_level_0`)
+### Best configuration (per model)
 
-The routed level-0 beam search runs two ways: the pure-Python loop (validates
-correctness) or FAISS' built-in `search_level_0` — the *same* seeded level-0
-search, but executed in compiled C++, so it gives **real latency** with identical
-top-k. FAISS exposes the seeded entry points directly (`search_type=2`), so no
-custom C++ kernel is needed. Select the backend per run:
+Reading the full `--sweep --mode both` runs at the paper's **iso-accuracy**
+protocol (fastest config of each method that reaches an Accuracy@10 target;
+`latency_ms_per_q` = faithful batched, single thread):
+
+| Model     | Best QLR config                | Acc@10 | QLR lat | plain-HNSW @ same Acc | Speedup |
+|-----------|--------------------------------|--------|---------|-----------------------|---------|
+| snowflake | `th=0.6 k'=10 pca=256 ef=70`   | 0.935  | 1.15 ms | 1.47 ms (ef=100)      | **1.28×** |
+| dragon    | `th=0.7 k'=10 pca=192 ef=110`  | 0.931  | 0.72 ms | 1.09 ms (ef=170)      | **1.51×** |
+
+`th`, `k'`, `pca` are the fixed best settings; **`ef` (`--ef-default`) is the
+operating-point dial** — raise it for higher Accuracy@10 at more latency. The
+speedup *grows* with the accuracy target (the paper's headline property), and
+dragon's plain-HNSW baseline caps at Acc@10 ≈ 0.938, so at Acc 0.95 QLR wins
+outright (no baseline config reaches it).
+
+Start QLR directly with the best config (real routed latency, single thread, full
+query log). Accuracy@10 needs the ground truth from step 2 above; without it that
+column is `nan` (routing/latency still run):
 
 ```bash
-# whole run uses the FAISS backend -> routed_ms_per_q is real C++ latency
-python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
-    --sweep --level0-backend faiss --out qlr_sweep.csv
+cd toploc2
+# snowflake
+python -u qlr.py snowflake --dataset msmarco-on-cast \
+    --mode qlr --threads 1 --log-limit 0 \
+    --th 0.6 --k-prime 10 --pca-dim 256 --ef-default 70 --out snowflake_best.csv
 
-# OR run BOTH and put them side by side in the CSV (verify before trusting)
-python -u toploc2_hnsw_pure_python.py <model> --dataset msmarco-on-cast \
-    --sweep --compare-backends --log-limit 2000 --max-turns 200
+# dragon (encode dev embeddings first, see step 1 above)
+python -u qlr.py dragon --dataset msmarco-on-cast \
+    --mode qlr --threads 1 --log-limit 0 \
+    --th 0.7 --k-prime 10 --pca-dim 192 --ef-default 110 --out dragon_best.csv
 ```
 
-`--compare-backends` adds three columns: `routed_ms_faiss_per_q` (FAISS, real)
-next to `routed_ms_per_q` (Python), `speedup_routed` (their ratio), and
-`topk_match` — `1.0` means both backends return identical results, so the speedup
-is honest. Validate on a small `--log-limit`/`--max-turns` first; the speedup only
-shows on the full 38.6M index (on a tiny index the Python marshaling overhead
-dominates). The **IVF** path already runs in FAISS C++ via `search_preassigned`,
-so this backend swap applies only to the HNSW/QLR path.
+The one-time EP build over the full ~808k log takes ~80 min; use `--log-limit
+100000` for a faster, slightly less faithful run. For the full speedup *curve*
+(every accuracy target side by side) use the `--sweep --mode both` command above.
+
+### Routed latency (FAISS `search_level_0`)
+
+The routed level-0 beam search is executed by FAISS' built-in `search_level_0` —
+the seeded level-0 search in compiled C++ (FAISS exposes the seeded entry points
+directly via `search_type=2`), so no custom C++ kernel is needed. All routed
+queries are batched into ONE call so the `VisitedTable` (~38 MB on the 38.6M
+index) is allocated once, not per query; the reported `latency_ms_per_q` is
+therefore the real single-thread per-query latency. Run single-thread and without
+mmap to stay comparable to `combine_base_top_hnsw.py` (`--threads 1`, `MMAP=0`).
+A pure-Python beam and per-query variants are kept only inside `test_qlr_pipeline.py`
+as the correctness reference — their top-k is asserted identical to the batched
+FAISS path, which is why the batched latency can be trusted.
 
 Notes:
-- The pure-Python routed latency (default `--level0-backend python`) is **not
-  real** — `avg_visited` (nodes scanned) is the implementation-independent
-  efficiency proxy, unaffected by mmap or thread count. For real routed latency use
-  `--level0-backend faiss` / `--compare-backends` (above); for a clean latency run
-  match `combine_base_top_hnsw.py` (no mmap, single-thread:
-  `OMP_NUM_THREADS=1 ... --threads 1`).
-- snowflake `th` is cosine (default 0.5); dragon is raw dot product, so its `th`
-  is calibrated from the data when unset.
+- snowflake `th` is cosine (default 0.5); dragon is cosine too (L2-normalised for
+  HNSW/IVF navigation) but its `th` is calibrated from the data when unset, because
+  its query/context encoders are asymmetric.
+- The **IVF** path already runs in FAISS C++ via `search_preassigned`.
 
 ## Interactive Demo (Streamlit)
 

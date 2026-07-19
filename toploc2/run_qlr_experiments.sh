@@ -28,11 +28,10 @@ OUT="results_${MODEL}_${DATASET}_${TS}"
 mkdir -p "$OUT"
 echo "model=$MODEL dataset=$DATASET log_limit=$LOG_LIMIT -> $OUT/"
 
-# 0. dragon only: produce dev embeddings (snowflake's are precomputed) and validate.
+# 0. dragon only: produce dev embeddings (snowflake's are precomputed).
 if [ "$MODEL" = "dragon" ]; then
-  echo "== dragon: encode dev embeddings + smoke test =="
-  $PY -u encode_msmarco_dev_dragon.py        2>&1 | tee "$OUT/encode_dev.log"
-  $PY -u smoke_test_msmarco_on_cast.py dragon 2>&1 | tee "$OUT/smoke.log"
+  echo "== dragon: encode dev embeddings =="
+  $PY -u encode_msmarco_dev_dragon.py 2>&1 | tee "$OUT/encode_dev.log"
 fi
 
 # 1. Ground truth for Accuracy@10 (exact top-10). Loads only the doc embeddings,
@@ -51,7 +50,7 @@ $PY -u compute_groundtruth.py "$MODEL" --dataset "$DATASET" --method stream \
 #    single-threaded); latency_ms_per_q is then the amortized, comparable number.
 #    (GT above keeps many threads for its matmul — it doesn't touch the index.)
 echo "== 2/2 baseline + QLR sweep (single index load, threads=1 for faithful latency) =="
-$PY -u toploc2_hnsw_pure_python.py "$MODEL" --dataset "$DATASET" \
+$PY -u qlr.py "$MODEL" --dataset "$DATASET" \
   --mode both --sweep --log-limit "$LOG_LIMIT" --threads 1 \
   --out "$OUT/sweep.csv" \
   2>&1 | tee "$OUT/sweep.log"

@@ -40,7 +40,7 @@ import os
 
 import numpy as np
 
-import toploc2_hnsw_pure_python as qlr
+import qlr
 
 MODEL = "dragon"
 

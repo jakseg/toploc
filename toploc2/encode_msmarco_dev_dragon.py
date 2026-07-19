@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import faiss
 
-from toploc2_hnsw_pure_python import load_query_encoder, MSMARCO_DEV_QUERY_DIRS
+from qlr import load_query_encoder, MSMARCO_DEV_QUERY_DIRS
 
 DEV_JSONL = os.environ.get(
     "DEV_JSONL",
