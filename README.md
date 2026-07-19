@@ -1,6 +1,13 @@
-# TopLoc Baseline Implementation
+# TopLoc & QLR Reimplementation
 
-Reimplementation of the baseline retrieval methods from the [TopLoc paper](https://arxiv.org/abs/2501.01onal) (SIGIR '25), using the TREC CAsT 2019/2020 datasets.
+Reimplementation of two retrieval papers on shared infrastructure:
+
+- **TopLoc** (SIGIR '25) — conversational retrieval (Exact / IVF / HNSW baselines
+  plus the TopLoc IVF/HNSW speedups) on TREC CAsT **2019 and 2020**.
+- **"HNSW Graph Meets Query Logs"** — the Query Log Router (QLR), a lightweight
+  router in front of an HNSW document index, on MS MARCO.
+
+Both run with the **Snowflake** and **Dragon** encoders.
 
 ## Setup
 
@@ -73,15 +80,15 @@ python create_index.py <model> <index_type> [dataset] [--param value ...]
 
 - `model`: `snowflake` or `dragon`
 - `index_type`: `exact`, `ivf`, `hnsw`, a comma-separated list (e.g. `exact,ivf`), or `all`
-- `dataset`: `cast2019` (default) or `msmarco` (the QLR/toploc2 collection; lands in
-  its own `toploc2/msmarco/<model>/` cache and builds HNSW with `ef_construction=500`)
+- `dataset`: `cast2019` (default). QLR does **not** need a separate index — it reuses
+  the CAST2019 index as its document index `I_D` (see the QLR section). A legacy
+  `msmarco` dataset also exists but is not used by the final pipeline.
 
 Examples:
 ```bash
 python create_index.py snowflake ivf            # CAST2019 (default)
 python create_index.py snowflake exact,ivf      # build two sequentially
 python create_index.py snowflake all            # exact + ivf + hnsw
-python create_index.py snowflake hnsw msmarco   # QLR document index (msmarco)
 ```
 
 #### Choosing the index parameters
@@ -121,28 +128,31 @@ The build streams embeddings from parquet and checkpoints every 50 files
 same command resumes from the last checkpoint. Per-index logs are written to
 the cache directory (e.g. `ivf_indexCreation.log`).
 
-### 3. Evaluate
+### 3. Evaluate (CAsT 2019 / 2020)
+
+Conversational retrieval and metrics run through `combine_hnsw.py` (HNSW, incl. the
+TopLoc-HNSW speedup) and `combine_IVF.py` (IVF). Each loads the document index from
+the model cache and reads the topics/qrels from `DATASET_DIR` (default = CAsT 2019).
+`--sweep` runs the full efSearch / nprobe grid; single-thread latency is the default.
+CAsT **2020 reuses the exact same index** — only `DATASET_DIR` changes.
 
 ```bash
-python evaluate_baseline.py <model> <index_type>
+# CAsT 2019 (default DATASET_DIR)
+python combine_hnsw.py snowflake hnsw --sweep
+python combine_IVF.py  snowflake ivf --sweep
+
+# CAsT 2020 — same indexes, only topics/qrels differ
+DATASET_DIR=/home/toploc2/Datasets/conversational/CAST2020/topics \
+  python combine_hnsw.py dragon hnsw --sweep
 ```
 
-Examples:
-```bash
-python evaluate_baseline.py snowflake ivf
-python evaluate_baseline.py dragon exact
-python evaluate_baseline.py snowflake hnsw
-```
+Reports NDCG@3/10, MRR@10 and single-thread per-query latency. Startup sanity:
+"Turns with relevant passages in index" must be > 0. On CAsT 2019 (paper Table 1)
+expect snowflake HNSW NDCG@10 ≈ 0.500, dragon ≈ 0.466 — validate 2019 before
+trusting 2020.
 
-Reports NDCG@10, MRR@10, and average query latency.
-
-### Test Pipeline
-
-Quick sanity check with a single query:
-
-```bash
-python test_ivf_pipeline.py <model>
-```
+> `combine_IVF.py` still defaults `CACHE_BASE` to a `toploc1` path; on this setup
+> prepend `CACHE_BASE=/home/toploc2/Datasets/toploc2` to its commands.
 
 ## QLR (Query Log Router — toploc2)
 
@@ -164,7 +174,7 @@ commands below are run from there (they import the driver as a sibling module).
 ```bash
 cd toploc2
 conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
-python test_qlr_pipeline.py       # synthetic, runs in seconds -> 14/14 passed
+python test_qlr_pipeline.py       # synthetic, runs in seconds -> 16/16 passed
 ```
 
 ### Run order (on the server)
@@ -173,7 +183,7 @@ All commands use `--dataset msmarco-on-cast`.
 
 **On `MMAP`:** memory-mapping only changes how fast vectors are read from disk, not
 the results — NDCG/MRR/Accuracy@10 and `avg_visited` are identical with or without
-it. To stay latency-comparable to `combine_base_top_hnsw.py` (the TopLoc-HNSW
+it. To stay latency-comparable to `combine_hnsw.py` (the TopLoc-HNSW
 comparison, which runs **without** mmap), leave `MMAP` unset (default off): the
 index is loaded fully into RAM, so the ~157 GiB snowflake index needs that much
 free RAM and loads slower. If RAM is tight, set `MMAP=1` — safe for accuracy/visited,
@@ -267,7 +277,7 @@ directly via `search_type=2`), so no custom C++ kernel is needed. All routed
 queries are batched into ONE call so the `VisitedTable` (~38 MB on the 38.6M
 index) is allocated once, not per query; the reported `latency_ms_per_q` is
 therefore the real single-thread per-query latency. Run single-thread and without
-mmap to stay comparable to `combine_base_top_hnsw.py` (`--threads 1`, `MMAP=0`).
+mmap to stay comparable to `combine_hnsw.py` (`--threads 1`, `MMAP=0`).
 A pure-Python beam and per-query variants are kept only inside `test_qlr_pipeline.py`
 as the correctness reference — their top-k is asserted identical to the batched
 FAISS path, which is why the batched latency can be trusted.
