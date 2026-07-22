@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-combine_all3.py
+combine_IVF.py
 ===============
 Baseline IVF  +  TopLoc-IVF  +  TopLoc-IVF+   in ONE script.
 
@@ -27,18 +27,18 @@ This script now times batched searches. Run it like:
     numactl --cpunodebind=0 --membind=0 \
     env NUM_THREADS=<physical cores of node 0> \
         OMP_NUM_THREADS=<same> OPENBLAS_NUM_THREADS=<same> MKL_NUM_THREADS=<same> \
-    python3 combine_all8.py snowflake ivf --sweep
+    python3 combine_IVF.py snowflake ivf --sweep
 
 Find your core count per NUMA node with:  numactl --hardware  /  lscpu
 
 Modes
 -----
   Single nprobe (NP env, default 128):
-      python3 combine_all3.py snowflake ivf
+      python3 combine_IVF.py snowflake ivf
   Full sweep (writes results3_<model>_<index>.csv):
-      python3 combine_all3.py snowflake ivf --sweep
+      python3 combine_IVF.py snowflake ivf --sweep
   Custom sweep:
-      python3 combine_all3.py snowflake ivf --sweep 1,4,16,64,256
+      python3 combine_IVF.py snowflake ivf --sweep 1,4,16,64,256
 """
 
 import os
@@ -52,9 +52,9 @@ import ir_measures
 from ir_measures import nDCG, RR
 
 # ================= CONFIGURATION =================
-CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc1/Datasets/toploc2")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
 DATASET_DIR = os.environ.get(
-    "DATASET_DIR", "/home/toploc1/Datasets/conversational/CAST2019/topics"
+    "DATASET_DIR", "/home/toploc2/Datasets/conversational/CAST2019/topics"
 )
 CACHE_DIRS = {
     "snowflake": os.path.join(CACHE_BASE, "snowflake"),
