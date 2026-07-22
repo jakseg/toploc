@@ -128,7 +128,7 @@ The build streams embeddings from parquet and checkpoints every 50 files
 same command resumes from the last checkpoint. Per-index logs are written to
 the cache directory (e.g. `ivf_indexCreation.log`).
 
-### 3. Evaluate (CAsT 2019 / 2020)
+### 3. Toploc HNSW/IVF/IVF+ (CAsT 2019 / 2020)
 
 Conversational retrieval and metrics run through `combine_hnsw.py` (HNSW, incl. the
 TopLoc-HNSW speedup) and `combine_IVF.py` (IVF). Each loads the document index from
@@ -137,13 +137,32 @@ the model cache and reads the topics/qrels from `DATASET_DIR` (default = CAsT 20
 CAsT **2020 reuses the exact same index** — only `DATASET_DIR` changes.
 
 ```bash
-# CAsT 2019 (default DATASET_DIR)
-python combine_hnsw.py snowflake hnsw --sweep
-python combine_IVF.py  snowflake ivf --sweep
+# CAsT 2019 (default DATASET_DIR) or CAsT 2020 
 
-# CAsT 2020 — same indexes, only topics/qrels differ
+# Running Toploc IVF and IVF+:
+
+# Snowflake:
+
+tmux new-session -s snow2020
+
+taskset -c 0-13 env NUM_THREADS=14 OMP_NUM_THREADS=14 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 DATASET_DIR=/home/toploc2/Datasets/conversational/CAST2020/topics \
-  python combine_hnsw.py dragon hnsw --sweep
+python3 -u combine_IVF.py snowflake ivf --sweep 2>&1 | tee results/snow_cast2020.log
+
+# Dragon:
+
+tmux new-session -s drag2020
+
+taskset -c 0-13 env NUM_THREADS=14 OMP_NUM_THREADS=14 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+DATASET_DIR=/home/toploc2/Datasets/conversational/CAST2020/topics \
+ALPHA_GRID="0.0,0.05,0.1,0.2" \
+python3 -u combine_IVF.py dragon ivf --sweep 16,32,64,128,256,512,1024,2048,4096 2>&1 | tee results/drag_cast2020.log
+
+
+
+# Running Toploc HNSw : * EDIT THIS PART * 
+python combine_hnsw.py snowflake hnsw --sweep
+
 ```
 
 Reports NDCG@3/10, MRR@10 and single-thread per-query latency. Startup sanity:
