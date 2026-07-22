@@ -1,4 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 numpy
 pyarrow
 ir_measures
+torch
+transformers
+sentence-transformers
 faiss-cpu<1.14
