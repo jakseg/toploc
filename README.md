@@ -20,11 +20,14 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# For toploc HNSW and QLR (deactivate the other one first):
+# venv-qlr -- for everything else (deactivate the other one first):
 python3 -m venv venv-qlr
 source venv-qlr/bin/activate
 pip install -r requirements-qlr.txt
 ```
+
+`venv-qlr` covers `create_embeddings/*`, `create_index.py`, `combine_hnsw.py` and
+everything under `toploc2/` (QLR).
 
 They are kept apart because QLR and `combine_hnsw.py --backend faiss` need
 **faiss < 1.14**: 1.14 flipped the sign convention of the seed distances in
@@ -40,11 +43,10 @@ them and are paper-faithful (toploc.pdf §Models). They stream any input and wri
 sharded parquet with columns `id`, `embedding` — the format `create_index.py` and
 the QLR driver consume. Both are model-parametrized (`snowflake` / `dragon`).
 
-Run from the repo root, in the project venv. Set the model once — every command
-below is model-parametrized:
+Run from the repo root. Set the model once — every command below is model-parametrized:
 
 ```bash
-source venv/bin/activate
+source venv-qlr/bin/activate
 
 D=/home/toploc2/Datasets/conversational
 M=snowflake          # or: M=dragon
