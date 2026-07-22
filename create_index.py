@@ -25,17 +25,24 @@ print(f"FAISS threads: {faiss.omp_get_max_threads()} (of {os.cpu_count()} cores)
 # QLR (toploc2) collection (~8.8M). msmarco lands in its own cache subdir so it
 # does not clobber the CAST2019 indexes, and uses the paper's HNSW
 # ef_construction=500 (CAST used a project default of 200).
+#
+# EMB_BASE / CACHE_BASE override the two roots (same env-var style as
+# combine_hnsw.py / combine_IVF.py). Useful to build a small index over a subset
+# of embeddings without touching the real cache:
+#   EMB_BASE=~/subset_check CACHE_BASE=~/subset_check/index python create_index.py ...
 DATASETS = {
     "cast2019": {
-        "embeddings_base": "/home/toploc2/Datasets/conversational/CAST2019",
+        "embeddings_base": os.environ.get(
+            "EMB_BASE", "/home/toploc2/Datasets/conversational/CAST2019"),
         "emb_subdir": {"snowflake": "snowflake_embeddings", "dragon": "dragon_embeddings"},
-        "cache_base": "/home/toploc2/Datasets/toploc2",
+        "cache_base": os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2"),
         "hnsw_ef_construction": 200,
     },
     "msmarco": {
-        "embeddings_base": "/home/toploc2/Datasets/conversational/msmarco",
+        "embeddings_base": os.environ.get(
+            "EMB_BASE", "/home/toploc2/Datasets/conversational/msmarco"),
         "emb_subdir": {"snowflake": "snowflake", "dragon": "dragon"},
-        "cache_base": "/home/toploc2/Datasets/toploc2/msmarco",
+        "cache_base": os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2/msmarco"),
         "hnsw_ef_construction": 500,
     },
 }
