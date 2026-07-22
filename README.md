@@ -25,55 +25,60 @@ pip install -r requirements.txt
 ### 1. Create Embeddings
 
 The finished embeddings were provided by our supervisor; these scripts reproduce
-them conceptually and are paper-faithful (toploc.pdf §Models). They stream any
-input and write sharded parquet with columns `id`, `embedding` — the format
-`create_index.py` and the QLR driver consume. All are model-parametrized
-(`snowflake` / `dragon`).
+them and are paper-faithful (toploc.pdf §Models). They stream any input and write
+sharded parquet with columns `id`, `embedding` — the format `create_index.py` and
+the QLR driver consume. Both are model-parametrized (`snowflake` / `dragon`).
 
-**Documents** (paper-1 collection, reused as I_D by QLR):
-
-```bash
-# smoke test (2k passages, one shard)
-python create_embeddings/create_document_embeddings.py snowflake \
-  --input dataset/head_2000_rows.tsv --out-dir data/snowflake --limit 2000
-
-# full CAsT2019 collection (38.6M) on the cluster
-python create_embeddings/create_document_embeddings.py dragon \
-  --input  /home/toploc2/Datasets/conversational/CAST2019/CAST2019collection.tsv \
-  --out-dir /home/toploc2/Datasets/conversational/CAST2019/dragon_embeddings
-```
-
-Encoding: snowflake = arctic-embed-l-v2.0, no query prompt, L2-normalised, 1024-d;
-dragon = dragon-plus-**context**-encoder, CLS token, 768-d. dragon is stored **raw**
-(dot product, norm ~65) by default — `create_index.py` L2-normalises at build time,
-so the index is identical; pass `--normalize` to store cosine-normalised dragon.
-
-**Queries** (QLR historical log Q_L, QLR dev queries, and CAsT 2019/2020 topics):
+Run from the repo root, in the project venv. Set the model once — every command
+below is model-parametrized:
 
 ```bash
-# QLR dev queries (jsonl), snowflake
-python create_embeddings/create_query_embeddings.py snowflake \
-  --input .../msmarco_queries/dev_queries.jsonl --input-format jsonl \
-  --out-dir .../msmarco_embeddings/dev_query
+source venv/bin/activate
 
-# CAsT2020 topics ("turn_id,query"), dragon, one file
-python create_embeddings/create_query_embeddings.py dragon \
-  --input .../CAST2020/topics/topics.tsv --input-format tsv --sep ',' \
-  --out-dir .../CAST2020/topics --prefix topics_dragon_embeddings --shard-size 0
+D=/home/toploc2/Datasets/conversational
+M=snowflake          # or: M=dragon
 ```
 
-Queries differ from documents by exactly one thing per model: snowflake adds the
-`query` prompt; dragon uses the dragon-plus-**query**-encoder (both L2-normalised).
+Every command is a **full run**. Append `--limit N --shard-size 0` to write a single
+small shard instead.
 
-**Verify conformance** against the supervisor's stored embeddings (cosine ≈ 1.0
-proves our encoder matches; runs on the cluster where text + parquet both live):
+#### Document collection
+
+The CAsT2019 collection, 38.6M passages:
 
 ```bash
-python create_embeddings/verify_embeddings.py snowflake --mode passage \
-  --emb-dir   /home/toploc2/Datasets/conversational/CAST2019/snowflake_embeddings \
-  --text-file /home/toploc2/Datasets/conversational/CAST2019/CAST2019collection.tsv \
-  --text-format tsv --n 20
+python create_embeddings/create_document_embeddings.py $M \
+  --input   $D/CAST2019/CAST2019collection.tsv \
+  --out-dir $D/CAST2019/${M}_embeddings
 ```
+
+#### QLR queries
+
+QLR searches the same document index built from the collection above (`I_D`), so it
+needs no new document embeddings — only queries: the historical query log `Q_L`
+(msmarco train, ~808k) and the test queries (msmarco dev.small).
+
+```bash
+# historical query log Q_L
+python create_embeddings/create_query_embeddings.py $M \
+  --input   $D/msmarco/msmarco_train_queries.jsonl --input-format jsonl \
+  --out-dir $D/msmarco/$M
+
+# test queries
+python create_embeddings/create_query_embeddings.py $M \
+  --input   $D/CAST2019/msmarco/msmarco_queries/dev_queries.jsonl --input-format jsonl \
+  --out-dir $D/CAST2019/msmarco/msmarco_embeddings/dev_query     # dragon: dev_query_dragon
+```
+
+#### Observations
+
+Checked against the supplied embeddings, per-id cosine ≥ 0.9999:
+
+- **Documents: snowflake normalised, dragon raw (norm ~65)** — each model is stored
+  the way it scores (dragon-plus uses raw dot product). `create_index.py`
+  L2-normalises both at build time, which is what the graph needs.
+- **The supplied dragon `Q_L` is un-normalised, ours is normalised** — same vectors,
+  different scale. `qlr.py` normalises at load, so both work.
 
 ### 2. Build Index
 
