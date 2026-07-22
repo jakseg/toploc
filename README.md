@@ -163,8 +163,21 @@ python3 -u combine_IVF.py dragon ivf --sweep 16,32,64,128,256,512,1024,2048,4096
 
 
 
-# Running Toploc HNSw : * EDIT THIS PART * 
-python combine_hnsw.py snowflake hnsw --sweep
+# Running Toploc HNSW:
+
+#Snowflake:
+
+#Dragon:
+
+tmux new -s dragon_cast2020_hnsw
+
+CACHE_BASE=/home/toploc2/Datasets/toploc2 \
+DATASET_DIR=/home/toploc2/Datasets/conversational/CAST2020/topics \
+MMAP=0 \
+OMP_NUM_THREADS=14 MKL_NUM_THREADS=14 OPENBLAS_NUM_THREADS=14 \
+taskset -c 0-13 python -u combine_hnsw.py dragon hnsw \
+  --backend faiss --threads 14 --entry-points 1 --sweep \
+  2>&1 | tee results/dragon_hnsw_cast2020_sweep_t14.log
 
 ```
 
