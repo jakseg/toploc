@@ -1,7 +1,8 @@
 name: toploc-demo
 # Environment for the laptop demo: faiss with C++ dev files (headers + lib +
 # CMake config) so the real toploc_search.cpp kernel can be compiled, plus the
-# Streamlit demo runtime. Recreate with:  conda env create -f environment.yml
+# Streamlit demo runtime. Created for you by ./demo/build_demo.sh; to recreate it
+# by hand:  conda env create -f demo/environment.yml
 channels:
   - conda-forge
 dependencies:
