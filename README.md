@@ -12,9 +12,12 @@ Both run with the **Snowflake** and **Dragon** encoders.
 ## Setup
 
 ```bash
+# For toploc IVF/IVF+:
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+# For toploc HNSW / QLR
 ```
 
 ## Pipeline
