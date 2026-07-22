@@ -173,9 +173,6 @@ Reports NDCG@3/10, MRR@10 and single-thread per-query latency. Startup sanity:
 expect snowflake HNSW NDCG@10 ≈ 0.500, dragon ≈ 0.466 — validate 2019 before
 trusting 2020.
 
-> `combine_IVF.py` still defaults `CACHE_BASE` to a `toploc1` path; on this setup
-> prepend `CACHE_BASE=/home/toploc2/Datasets/toploc2` to its commands.
-
 ## QLR (Query Log Router — toploc2)
 
 Reimplementation of "HNSW Graph Meets Query Logs": a lightweight router in front
