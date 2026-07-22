@@ -363,6 +363,11 @@ known CAsT turns — live NDCG/MRR. Exact and IVF use plain FAISS; **TopLoc IVF
 calls the real `toploc_search` C++ kernel** (the same one used in the benchmark
 scripts), with a pure-Python fallback if the module is not compiled.
 
+The demo runs in its own conda environment (`toploc-demo`) — neither `venv` nor
+`venv-qlr` can run it, because compiling the C++ kernel needs FAISS' C++ dev files,
+which the pip wheel does not ship. `./demo/build_demo.sh` creates that environment
+and compiles the kernel in one step; nothing else in this repo depends on it.
+
 ### 1. Get the demo subset (`demo/data/`)
 
 The demo needs a self-contained `demo/data/` folder (passages, FAISS indices,
