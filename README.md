@@ -83,28 +83,31 @@ Checked against the supplied embeddings, per-id cosine ≥ 0.9999:
 ### 2. Build Index
 
 ```bash
-python create_index.py <model> <index_type> [dataset] [--param value ...]
+python create_index.py <model> <index_type> [--param value ...]
 ```
 
 - `model`: `snowflake` or `dragon`
 - `index_type`: `exact`, `ivf`, `hnsw`, a comma-separated list (e.g. `exact,ivf`), or `all`
-- `dataset`: `cast2019` (default). QLR does **not** need a separate index — it reuses
-  the CAST2019 index as its document index `I_D` (see the QLR section). A legacy
-  `msmarco` dataset also exists but is not used by the final pipeline.
 
-Examples:
+The CAsT 2019 collection is the only one indexed — it contains MS MARCO v1 (as
+`MARCO_<n>`), so CAsT 2020 and QLR reuse the same index. Paths come from `EMB_BASE`
+(embeddings root, expects `<model>_embeddings/`) and `CACHE_BASE` (index output); both
+default to the cluster locations, so point them elsewhere to build over a subset:
+
 ```bash
-python create_index.py snowflake ivf            # CAST2019 (default)
-python create_index.py snowflake exact,ivf      # build two sequentially
-python create_index.py snowflake all            # exact + ivf + hnsw
+EMB_BASE=~/subset_check CACHE_BASE=~/subset_check/index python create_index.py snowflake hnsw
 ```
+
+**What our indexes were built with** (CAsT 2019/2020 + QLR `I_D`): IVF `2^18` centroids
+(dragon) / `2^15` (snowflake), `nprobe=128`, k-means `niter=10` on 40 × centroids
+training samples · HNSW `M=32`, `efConstruction=200`, `efSearch=64` · Exact
+`IndexFlatIP` · all L2-normalized, `METRIC_INNER_PRODUCT` (cosine).
 
 #### Choosing the index parameters
 
-Every index parameter is exposed as an optional flag. **Omit a flag and the build
-uses the paper-faithful per-model / per-dataset default**, so the positional-only form
-above reproduces the paper. Pass a flag to override it. The values tested in the two
-papers are listed with `python create_index.py --help`; the same grid in short:
+Omit a flag and the build uses the paper-faithful per-model default — the
+positional-only form reproduces the paper; pass a flag to override it. Full paper grids:
+`python create_index.py --help`.
 
 | Flag | Applies to | Paper values | Default |
 |------|-----------|--------------|---------|
@@ -113,7 +116,7 @@ papers are listed with `python create_index.py --help`; the same grid in short:
 | `--kmeans-niter` | IVF | 25 (FAISS default), 10 (project) | 25 |
 | `--train-sample-size` | IVF | ≥ 39 × `num_centroids` (FAISS heuristic) | auto (≥ 40 × centroids) |
 | `--M` | HNSW | `{16, 32, 64}` (TopLoc); 32 (QLR) | 32 |
-| `--ef-construction` | HNSW | 500 (QLR); 200 (project default) | 200 (cast2019) / 500 (msmarco) |
+| `--ef-construction` | HNSW | 500 (QLR); TopLoc leaves it unspecified | 200 (what the built indexes use) |
 | `--ef-search` | HNSW | 1…4096 pow2 (TopLoc); 10…200 step 10 (QLR) | 64 |
 | `--normalize / --no-normalize` | both | Dragon L2-normalized for cosine (TopLoc) | `--normalize` |
 
@@ -121,20 +124,18 @@ papers are listed with `python create_index.py --help`; the same grid in short:
 defaults; the evaluation scripts sweep them. Keep `--normalize` on: an un-normalized
 HNSW/IVF graph on Dragon degenerates (norm-bias hubs → ~0 recall).
 
-Examples:
 ```bash
-# reproduce the paper build (no flags needed)
-python create_index.py dragon ivf                                   # 2^18 centroids
-python create_index.py snowflake ivf                                # 2^15 centroids
-# pick your own parameters
-python create_index.py dragon ivf  --num-centroids 131072 --kmeans-niter 10
-python create_index.py snowflake hnsw --M 64 --ef-construction 500
+python create_index.py dragon ivf                    # paper build, no flags needed
+python create_index.py snowflake exact,ivf           # several types sequentially
+python create_index.py snowflake hnsw --M 64 --ef-construction 500   # your own params
 ```
 
-The build streams embeddings from parquet and checkpoints every 50 files
-(index + ids + checkpoint metadata). If a build is interrupted, rerunning the
-same command resumes from the last checkpoint. Per-index logs are written to
-the cache directory (e.g. `ivf_indexCreation.log`).
+The build streams embeddings from parquet, checkpoints every 50 files and resumes from
+the last checkpoint if rerun; per-index logs land in the cache directory (e.g.
+`ivf_indexCreation.log`). **To rebuild with different parameters**, delete the three
+artifacts first (`<type>_index.index`, `<type>_ids.npy`, `<type>_checkpoint.json`) —
+the filename does not encode the parameters, so an existing index is otherwise reused
+and the flags are ignored (with a warning).
 
 ### 3. Toploc HNSW/IVF/IVF+ (CAsT 2019 / 2020)
 

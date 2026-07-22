@@ -21,31 +21,17 @@ faiss.omp_set_num_threads(int(os.environ.get("FAISS_THREADS", os.cpu_count() or 
 print(f"FAISS threads: {faiss.omp_get_max_threads()} (of {os.cpu_count()} cores)")
 
 # ================= CONFIGURATION =================
-# Per-dataset paths. CAST2019 is the first paper (38M collection); msmarco is the
-# QLR (toploc2) collection (~8.8M). msmarco lands in its own cache subdir so it
-# does not clobber the CAST2019 indexes, and uses the paper's HNSW
-# ef_construction=500 (CAST used a project default of 200).
+# The CAST2019 collection (38.6M passages) is the only document collection we index.
+# It already contains MS MARCO v1 (as MARCO_<n>), so QLR reuses this index as its
+# document index I_D instead of building a separate one.
 #
 # EMB_BASE / CACHE_BASE override the two roots (same env-var style as
 # combine_hnsw.py / combine_IVF.py). Useful to build a small index over a subset
 # of embeddings without touching the real cache:
 #   EMB_BASE=~/subset_check CACHE_BASE=~/subset_check/index python create_index.py ...
-DATASETS = {
-    "cast2019": {
-        "embeddings_base": os.environ.get(
-            "EMB_BASE", "/home/toploc2/Datasets/conversational/CAST2019"),
-        "emb_subdir": {"snowflake": "snowflake_embeddings", "dragon": "dragon_embeddings"},
-        "cache_base": os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2"),
-        "hnsw_ef_construction": 200,
-    },
-    "msmarco": {
-        "embeddings_base": os.environ.get(
-            "EMB_BASE", "/home/toploc2/Datasets/conversational/msmarco"),
-        "emb_subdir": {"snowflake": "snowflake", "dragon": "dragon"},
-        "cache_base": os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2/msmarco"),
-        "hnsw_ef_construction": 500,
-    },
-}
+EMB_BASE = os.environ.get("EMB_BASE", "/home/toploc2/Datasets/conversational/CAST2019")
+CACHE_BASE = os.environ.get("CACHE_BASE", "/home/toploc2/Datasets/toploc2")
+EMB_SUBDIR = {"snowflake": "snowflake_embeddings", "dragon": "dragon_embeddings"}
 
 # Paper parameters (Table 1, Section 3 — full 38M collection)
 INDEX_PARAMS = {
@@ -257,7 +243,7 @@ def build_index(model_name, index_type, parquet_files, dim, cache_dir,
 
 # ================= MAIN =================
 # Every index parameter is exposed as an optional flag. When a flag is omitted the
-# build falls back to the paper-faithful per-model / per-dataset default, so the
+# build falls back to the paper-faithful per-model default, so the
 # positional-only form still reproduces the paper. The flag values tested in the
 # two papers are listed in the --help epilog below.
 PARAM_HELP = textwrap.dedent("""\
@@ -284,8 +270,6 @@ parser = argparse.ArgumentParser(
 parser.add_argument("model", nargs="?", default="snowflake", choices=["snowflake", "dragon"])
 parser.add_argument("index_type", nargs="?", default="ivf",
                     help="exact | ivf | hnsw | comma-list (e.g. exact,ivf) | all")
-parser.add_argument("dataset", nargs="?", default=os.environ.get("DATASET", "cast2019"),
-                    choices=list(DATASETS), help="cast2019 (default) | msmarco")
 g = parser.add_argument_group("index parameters (override the paper-faithful defaults)")
 g.add_argument("--num-centroids", type=int, default=None, help="IVF: number of k-means centroids")
 g.add_argument("--nprobe", type=int, default=None, help="IVF: lists probed at search time")
@@ -300,7 +284,6 @@ args = parser.parse_args()
 
 model_name = args.model
 type_arg = args.index_type
-dataset = args.dataset
 
 if type_arg == "all":
     index_types = list(VALID_INDEX_TYPES)
@@ -311,18 +294,11 @@ else:
             print(f"Unknown index type: {t}. Use one of {VALID_INDEX_TYPES} or 'all'.")
             sys.exit(1)
 
-ds = DATASETS[dataset]
-emb_dir = os.path.join(ds["embeddings_base"], ds["emb_subdir"][model_name])
-cache_dir = os.path.join(ds["cache_base"], model_name)
+emb_dir = os.path.join(EMB_BASE, EMB_SUBDIR[model_name])
+cache_dir = os.path.join(CACHE_BASE, model_name)
 os.makedirs(cache_dir, exist_ok=True)
 
-# Dataset-specific HNSW build quality (QLR paper uses 500; CAST used 200). Applied
-# before the CLI overrides so an explicit --ef-construction still wins.
-for m in INDEX_PARAMS:
-    if "hnsw" in INDEX_PARAMS[m]:
-        INDEX_PARAMS[m]["hnsw"]["ef_construction"] = ds["hnsw_ef_construction"]
-
-# CLI overrides on top of the per-model / per-dataset defaults (only when provided).
+# CLI overrides on top of the per-model defaults (only when provided).
 if args.num_centroids is not None:
     INDEX_PARAMS[model_name].setdefault("ivf", {})["num_centroids"] = args.num_centroids
 if args.nprobe is not None:
@@ -346,8 +322,8 @@ if not args.normalize:
     overridden_flags.append("--no-normalize")
 
 parquet_files, dim = get_parquet_info(emb_dir)
-print(f"Dataset: {dataset} | Model: {model_name} | Types: {index_types} | "
-      f"{len(parquet_files)} parquet files, dim={dim} | cache={cache_dir}")
+print(f"Model: {model_name} | Types: {index_types} | {len(parquet_files)} parquet files, "
+      f"dim={dim} | emb={emb_dir} | cache={cache_dir}")
 print(f"Params: normalize={args.normalize} | kmeans_niter={kmeans_niter} | "
       f"train_sample={args.train_sample_size or 'auto (>= 40 x centroids)'}")
 print(f"        IVF={INDEX_PARAMS[model_name].get('ivf', {})} | "
