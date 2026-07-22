@@ -1,0 +1,4 @@
+numpy
+pyarrow
+ir_measures
+faiss-cpu<1.14

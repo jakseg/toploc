@@ -1,5 +1,6 @@
 # Virtual environment
 venv/
+venv-qlr/
 
 # Python
 __pycache__/

@@ -11,14 +11,25 @@ Both run with the **Snowflake** and **Dragon** encoders.
 
 ## Setup
 
+Two separate environments, one per part of the project — activate whichever the step
+below belongs to:
+
 ```bash
 # For toploc IVF/IVF+:
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# For toploc HNSW / QLR
+# For toploc HNSW and QLR (deactivate the other one first):
+python3 -m venv venv-qlr
+source venv-qlr/bin/activate
+pip install -r requirements-qlr.txt
 ```
+
+They are kept apart because QLR and `combine_hnsw.py --backend faiss` need
+**faiss < 1.14**: 1.14 flipped the sign convention of the seed distances in
+`search_level_0`, so the seeded level-0 search returns silently wrong results there.
+`requirements-qlr.txt` pins that upper bound without imposing it on the IVF side.
 
 ## Pipeline
 
@@ -220,10 +231,14 @@ commands below are run from there (they import the driver as a sibling module).
 ### 0. Local sanity check (no server needed)
 
 ```bash
+source venv-qlr/bin/activate      # see Setup; any env with faiss<1.14 + pyarrow + ir_measures
 cd toploc2
-conda activate toploc-demo        # any env with faiss + pyarrow + ir_measures
 python test_qlr_pipeline.py       # synthetic, runs in seconds -> 16/16 passed
 ```
+
+Run this first in any new environment: it asserts the seeded level-0 search against a
+pure-Python reference, so a wrong faiss version shows up here (15/16,
+`faiss_level0_matches_python`) instead of as quietly worse numbers later.
 
 ### Run order (on the server)
 
