@@ -171,6 +171,11 @@ taskset -c 0-13 env NUM_THREADS=14 OMP_NUM_THREADS=14 OPENBLAS_NUM_THREADS=1 MKL
 DATASET_DIR=/home/toploc2/Datasets/conversational/CAST2020/topics \
 python3 -u combine_IVF.py snowflake ivf --sweep 2>&1 | tee results/snow_cast2020.log
 
+# OR to run using CasT 2019 (Default Dataset DIR)
+
+taskset -c 0-13 env NUM_THREADS=14 OMP_NUM_THREADS=14 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python3 -u combine_IVF.py snowflake ivf --sweep 2>&1 | tee results/snow_cast2020.log
+
 # Dragon:
 
 tmux new-session -s drag2020
