@@ -355,68 +355,36 @@ Notes:
 
 ## Interactive Demo (Streamlit)
 
+> **Note:** the demo is a standalone illustration and is **not** part of the
+> result pipeline above. It reflects the code as of the demo presentation and
+> is not kept in sync with later changes — use the pipeline sections for the
+> reproducible results.
+
 A small Streamlit app that runs conversational retrieval over a compact subset
-(all judged passages + distractors) so it fits on a laptop. Per query it shows
-the retrieved passages, the number of vectors actually compared (a
-scale-independent efficiency proxy), the speedup vs exact search, and — for
-known CAsT turns — live NDCG/MRR. Exact and IVF use plain FAISS; **TopLoc IVF
-calls the real `toploc_search` C++ kernel** (the same one used in the benchmark
-scripts), with a pure-Python fallback if the module is not compiled.
-
-The demo runs in its own conda environment (`toploc-demo`) — neither `venv` nor
-`venv-qlr` can run it, because compiling the C++ kernel needs FAISS' C++ dev files,
-which the pip wheel does not ship. `./demo/build_demo.sh` creates that environment
-and compiles the kernel in one step; nothing else in this repo depends on it.
-
-### 1. Get the demo subset (`demo/data/`)
-
-The demo needs a self-contained `demo/data/` folder (passages, FAISS indices,
-query embeddings, topics, qrels, meta). It is a generated artifact and **not**
-committed (gitignored). Two ways to obtain it:
-
-**a) Download the prebuilt subset (recommended).** It is attached as an asset to
-the `demo-data` release:
+so it fits on a laptop. Per query it shows the retrieved passages, the number of
+vectors compared (an efficiency proxy), the speedup vs exact search, and live
+NDCG/MRR for known CAsT turns. Exact and IVF use plain FAISS; TopLoc IVF calls
+the real `toploc_search` C++ kernel (Python fallback if uncompiled). It runs in
+its own conda environment (`toploc-demo`), separate from `venv`/`venv-qlr`.
 
 ```bash
+# 1. Get the demo subset -> demo/data/ (generated artifact, gitignored)
 cd demo
-gh release download demo-data -p demo_data.zip   # or download from the Releases page
-unzip demo_data.zip                               # creates demo/data/
-```
+gh release download demo-data -p demo_data.zip && unzip demo_data.zip   # prebuilt (recommended)
+# or rebuild where the full data lives: python demo/build_demo_subset.py
 
-**b) Rebuild it (where the full data lives).**
+# 2. Build the env + C++ kernel (needs a C++ compiler; run once per machine)
+./demo/build_demo.sh
 
-```bash
-python demo/build_demo_subset.py
-```
-
-The full 38M collection is only needed for rebuilding; the demo itself runs
-entirely off `demo/data/`.
-
-### 2. Set up the demo environment and build the C++ kernel
-
-Running the real `toploc_search` kernel needs FAISS with C++ dev files, so the
-demo uses a conda environment (`environment.yml`). A system C++ compiler is
-required for the build (macOS: `xcode-select --install`; Linux: `build-essential`).
-
-```bash
-./demo/build_demo.sh   # creates the 'toploc-demo' conda env and compiles toploc_search
-```
-
-This recreates the environment from `environment.yml` and builds
-`toploc_search.*.so` (platform-specific, gitignored — run once per machine).
-
-### 3. Run the app
-
-```bash
+# 3. Run
 conda activate toploc-demo
 streamlit run demo/demo_app.py
 ```
 
-Pick a known CAsT turn from the sidebar (precomputed embedding + metrics) or type
-a free-text query, switch between **Exact / IVF / TopLoc IVF**, and tune
-`nprobe` and the number of cached centroids `h`. In a conversation the first turn
-seeds the TopLoc cache (standard IVF search); follow-up turns reuse it and scan
-far fewer vectors.
+Pick a known CAsT turn (precomputed) or type a free-text query, switch between
+**Exact / IVF / TopLoc IVF**, and tune `nprobe` and cached centroids `h`. The
+first turn seeds the TopLoc cache; follow-up turns reuse it and scan far fewer
+vectors.
 
 ## Data Structure
 
