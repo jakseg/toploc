@@ -18,6 +18,9 @@ build/
 # Generated demo artifacts (rebuilt by demo/build_demo_subset.py)
 demo/data/
 
+# QLR sweep outputs (results go on the slides, not the repo)
+toploc2/results/
+
 # Model cache
 .cache/
 

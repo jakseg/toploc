@@ -150,6 +150,20 @@ artifacts first (`<type>_index.index`, `<type>_ids.npy`, `<type>_checkpoint.json
 the filename does not encode the parameters, so an existing index is otherwise reused
 and the flags are ignored (with a warning).
 
+**Dragon only — one extra step after building.** `create_index.py` writes the Dragon
+index to `<CACHE_BASE>/dragon/`, but for historical reasons the HNSW eval
+(`combine_hnsw.py`) and QLR (`qlr.py`) read it from `<CACHE_BASE>/dragon/_cosine_old/`
+(`combine_IVF.py` reads `dragon/` directly). After a fresh Dragon build, add one symlink
+so all three resolve to the same index:
+
+```bash
+ln -sfn . "$CACHE_BASE/dragon/_cosine_old"      # Dragon only; Snowflake needs nothing
+```
+
+This is safe because `create_index.py` now L2-normalizes Dragon (the `_cosine_old`
+indirection dates back to when `dragon/` held an un-normalized build). Snowflake builds
+and reads the same `snowflake/` directory throughout — no symlink needed.
+
 ### 3. Toploc HNSW/IVF/IVF+ (CAsT 2019 / 2020)
 
 Conversational retrieval and metrics run through `combine_hnsw.py` (HNSW, incl. the
@@ -220,7 +234,7 @@ Reports NDCG@3/10, MRR@10 and single-thread per-query latency. Startup sanity:
 expect snowflake HNSW NDCG@10 ≈ 0.500, dragon ≈ 0.466 — validate 2019 before
 trusting 2020.
 
-## QLR (Query Log Router — toploc2)
+## QLR (Query Log Router)
 
 Reimplementation of "HNSW Graph Meets Query Logs": a lightweight router in front
 of a standard HNSW document index. It runs on `msmarco-on-cast` — the CAST2019
@@ -228,48 +242,38 @@ HNSW index is the document index `I_D` (it already contains every msmarco passag
 as `MARCO_<n>`), with the msmarco train split as the query log `Q_L` and the
 msmarco dev queries + `qrels.dev.small.tsv` as the test set.
 
-Driver: `qlr.py` (pure Python, no C++). Two metrics are
-reported: **Accuracy@10** (fraction of the *exhaustive* top-10 retrieved — the
-paper's headline metric) and qrels-based **NDCG@3/10 + MRR@10**.
+Driver: `qlr.py` (pure Python, no C++). Two metrics are reported: **Accuracy@10**
+(fraction of the *exhaustive* top-10 retrieved — the paper's headline metric) and
+qrels-based **NDCG@3/10 + MRR@10**.
 
-All QLR scripts live in the **`toploc2/`** directory — `cd toploc2` first; the
-commands below are run from there (they import the driver as a sibling module).
-
-### 0. Local sanity check (no server needed)
+Run everything from `toploc2/`, inside `tmux` (the one-time EP build over the full
+~808k log takes ~80 min), in `venv-qlr`. That env already covers the TopLoc-HNSW step,
+so if you built it there just activate it — otherwise set it up (see Setup):
 
 ```bash
-source venv-qlr/bin/activate      # see Setup; any env with faiss<1.14 + pyarrow + ir_measures
+tmux new -s qlr
 cd toploc2
+
+source ../venv-qlr/bin/activate                 # if venv-qlr already exists
+# --- otherwise create it first: ---
+# python3 -m venv ../venv-qlr && source ../venv-qlr/bin/activate
+# pip install -r ../requirements-qlr.txt
+```
+
+### 0. Sanity check (no server needed)
+
+```bash
 python test_qlr_pipeline.py       # synthetic, runs in seconds -> 16/16 passed
 ```
 
 Run this first in any new environment: it asserts the seeded level-0 search against a
-pure-Python reference, so a wrong faiss version shows up here (15/16,
-`faiss_level0_matches_python`) instead of as quietly worse numbers later.
+pure-Python reference. If `faiss_level0_matches_python` fails (15/16), the env has
+faiss ≥ 1.14 (flipped seed-distance signs) — reinstall from `requirements-qlr.txt`,
+which pins `faiss-cpu<1.14`.
 
-### Run order (on the server)
+### Run (per model)
 
 All commands use `--dataset msmarco-on-cast`.
-
-**On `MMAP`:** memory-mapping only changes how fast vectors are read from disk, not
-the results — NDCG/MRR/Accuracy@10 and `avg_visited` are identical with or without
-it. To stay latency-comparable to `combine_hnsw.py` (the TopLoc-HNSW
-comparison, which runs **without** mmap), leave `MMAP` unset (default off): the
-index is loaded fully into RAM, so the ~157 GiB snowflake index needs that much
-free RAM and loads slower. If RAM is tight, set `MMAP=1` — safe for accuracy/visited,
-only a real-latency comparison would then not match. (`compute_groundtruth.py` never
-loads the HNSW index, so mmap is irrelevant there.)
-
-**One-shot wrapper** (runs steps 1–4 below and tees logs to
-`results_<model>_<dataset>_<ts>/`):
-
-```bash
-bash run_qlr_experiments.sh snowflake               # snowflake (data validated)
-bash run_qlr_experiments.sh dragon                  # encodes dev embeddings first
-LOG_LIMIT=0 bash run_qlr_experiments.sh snowflake   # full ~808k log (default caps |Q_L| at 100k)
-```
-
-Or the individual steps, in order:
 
 1. **(dragon only)** encode the dev queries:
    ```bash
@@ -277,86 +281,65 @@ Or the individual steps, in order:
    ```
 
 2. **ground truth for Accuracy@10** (one-time exact top-10; streams the doc
-   embeddings, does not load the HNSW index). The matmul uses numpy/BLAS, so
-   thread it via `OMP_NUM_THREADS`, not `--threads`:
+   embeddings, does not load the HNSW index — thread it via `OMP_NUM_THREADS`):
    ```bash
    OMP_NUM_THREADS=14 python compute_groundtruth.py <model> --dataset msmarco-on-cast
    ```
 
-3. **baseline + QLR in ONE run** — `--mode both` loads the ~157 GiB index *once*,
-   then runs the plain-HNSW efSearch sweep **and** the QLR sweep (`th × k' × ef ×
-   PCA`), writing both to one CSV (the `mode` column separates them; EP/s_max are
-   built once and reused across the QLR grid):
+3. **baseline + QLR sweep in ONE run** — `--mode both` loads the ~157 GiB index
+   *once*, then runs the plain-HNSW efSearch sweep **and** the QLR sweep into one CSV
+   (the `mode` column separates them; EP/s_max are built once and reused across the
+   grid). A bare `--sweep` reproduces the full paper grid; override single axes with
+   `--th-list/--kprime-list/--ef-list/--pca-list`:
    ```bash
    python -u qlr.py <model> --dataset msmarco-on-cast \
-       --mode both --sweep --log-limit 100000 --threads 14 --out sweep.csv
+       --mode both --sweep --log-limit 0 --threads 1 --out <model>_sweep.csv
    ```
 
-In `sweep.csv` compare `mode=baseline` vs `mode=qlr`: QLR should reach about the
-**same Accuracy@10 as the baseline** on the identical index. A quick first run
-(also one index load):
+| Flag | Meaning | Paper grid / default |
+|------|---------|----------------------|
+| `--th` | routing threshold (fallback when `s < th`) | snowflake {0.3…0.7}; dragon data-driven |
+| `--k-prime` | log queries retrieved per incoming query | {10, 20} |
+| `--pca-dim` | PCA on `I_Q` | dim/4 = 256 (snowflake) / 192 (dragon) |
+| `--ef-default` | operating point (upper bound of adaptive ef') | 100 |
+| `--log-limit` | cap on \|Q_L\| (0 = full ~808k log) | 0 |
+| `--mode` | `baseline` / `qlr` / `both` | qlr |
 
-```bash
-python -u qlr.py snowflake --dataset msmarco-on-cast \
-    --mode both --log-limit 2000 --max-turns 50
-```
+Each CSV row is one config: `mode, th, k_prime, ef, pca, Accuracy@10, NDCG@10,
+MRR@10, latency_ms_per_q` (+ `qlr_route/seeded/fallback_ms_per_q` = the routed-latency
+breakdown). Compare `mode=baseline` vs `mode=qlr` at matched Accuracy@10.
 
-### Best configuration (per model)
+**On `MMAP`:** leave it unset (default off) so the index loads fully into RAM and the
+latency stays comparable to `combine_hnsw.py`; the ~157 GiB snowflake index needs that
+much free RAM. `MMAP=1` is safe for accuracy/`avg_visited` (identical) — only a
+real-latency comparison would then not match.
 
-Reading the full `--sweep --mode both` runs at the paper's **iso-accuracy**
-protocol (fastest config of each method that reaches an Accuracy@10 target;
-`latency_ms_per_q` = faithful batched, single thread):
+### Speedup at matched accuracy (iso-accuracy)
 
-| Model     | Best QLR config                | Acc@10 | QLR lat | plain-HNSW @ same Acc | Speedup |
+QLR has no single "best" config: like `nprobe`/`efSearch` for IVF/HNSW, `--ef-default`
+is an operating-point dial — raise it for higher Accuracy@10 at more latency. At each
+Accuracy@10 target you read off the fastest config of each method that reaches it; the
+speedup *grows* with the target (the paper's headline property). Example points
+(`latency_ms_per_q` = faithful batched, single thread):
+
+| Model     | QLR config at this point       | Acc@10 | QLR lat | plain-HNSW @ same Acc | Speedup |
 |-----------|--------------------------------|--------|---------|-----------------------|---------|
 | snowflake | `th=0.6 k'=10 pca=256 ef=70`   | 0.935  | 1.15 ms | 1.47 ms (ef=100)      | **1.28×** |
 | dragon    | `th=0.7 k'=10 pca=192 ef=110`  | 0.931  | 0.72 ms | 1.09 ms (ef=170)      | **1.51×** |
 
-`th`, `k'`, `pca` are the fixed best settings; **`ef` (`--ef-default`) is the
-operating-point dial** — raise it for higher Accuracy@10 at more latency. The
-speedup *grows* with the accuracy target (the paper's headline property), and
-dragon's plain-HNSW baseline caps at Acc@10 ≈ 0.938, so at Acc 0.95 QLR wins
-outright (no baseline config reaches it).
+dragon's plain-HNSW baseline caps at Acc@10 ≈ 0.938, so at Acc 0.95 QLR wins outright
+(no baseline config reaches it).
 
-Start QLR directly with the best config (real routed latency, single thread, full
-query log). Accuracy@10 needs the ground truth from step 2 above; without it that
-column is `nan` (routing/latency still run):
+### Notes
 
-```bash
-cd toploc2
-# snowflake
-python -u qlr.py snowflake --dataset msmarco-on-cast \
-    --mode qlr --threads 1 --log-limit 0 \
-    --th 0.6 --k-prime 10 --pca-dim 256 --ef-default 70 --out snowflake_best.csv
-
-# dragon (encode dev embeddings first, see step 1 above)
-python -u qlr.py dragon --dataset msmarco-on-cast \
-    --mode qlr --threads 1 --log-limit 0 \
-    --th 0.7 --k-prime 10 --pca-dim 192 --ef-default 110 --out dragon_best.csv
-```
-
-The one-time EP build over the full ~808k log takes ~80 min; use `--log-limit
-100000` for a faster, slightly less faithful run. For the full speedup *curve*
-(every accuracy target side by side) use the `--sweep --mode both` command above.
-
-### Routed latency (FAISS `search_level_0`)
-
-The routed level-0 beam search is executed by FAISS' built-in `search_level_0` —
-the seeded level-0 search in compiled C++ (FAISS exposes the seeded entry points
-directly via `search_type=2`), so no custom C++ kernel is needed. All routed
-queries are batched into ONE call so the `VisitedTable` (~38 MB on the 38.6M
-index) is allocated once, not per query; the reported `latency_ms_per_q` is
-therefore the real single-thread per-query latency. Run single-thread and without
-mmap to stay comparable to `combine_hnsw.py` (`--threads 1`, `MMAP=0`).
-A pure-Python beam and per-query variants are kept only inside `test_qlr_pipeline.py`
-as the correctness reference — their top-k is asserted identical to the batched
-FAISS path, which is why the batched latency can be trusted.
-
-Notes:
+- The routed level-0 beam runs natively via FAISS `search_level_0` (`search_type=2`,
+  no custom C++); all routed queries are batched into ONE call so the `VisitedTable`
+  (~38 MB) is allocated once — `latency_ms_per_q` is therefore real single-thread
+  latency. A pure-Python beam is kept only in `test_qlr_pipeline.py` as the correctness
+  reference (its top-k is asserted identical to the batched FAISS path).
 - snowflake `th` is cosine (default 0.5); dragon is cosine too (L2-normalised for
   HNSW/IVF navigation) but its `th` is calibrated from the data when unset, because
   its query/context encoders are asymmetric.
-- The **IVF** path already runs in FAISS C++ via `search_preassigned`.
 
 ## Interactive Demo (Streamlit)
 
@@ -393,8 +376,34 @@ vectors.
 
 ## Data Structure
 
+Every script is driven by two roots — the input embeddings/topics
+(`EMB_BASE` / `DATASET_DIR` / `MSMARCO_BASE`) and the index output (`CACHE_BASE`).
+Both default to the cluster layout below:
+
 ```
-dataset/              Raw data (passages, topics, qrels)
-data/snowflake/       Snowflake embeddings, id map, and indices
-data/dragon/          Dragon embeddings, id map, and indices
+Datasets/conversational/
+  CAST2019/
+    CAST2019collection.tsv              38.6M passages (MS MARCO v1 + TREC CAR)
+    topics/                             DATASET_DIR: topics.tsv, qrels.qrel (CAsT 2019)
+    snowflake_embeddings/               EMB_BASE input: document embeddings (per model)
+    dragon_embeddings/
+    msmarco/                            MSMARCO_BASE: QLR test set
+      msmarco_embeddings/dev_query/       dev queries (snowflake)
+      msmarco_embeddings/dev_query_dragon/ dev queries (dragon)
+      qrels.dev.small.tsv
+  CAST2020/topics/                      DATASET_DIR for CAsT 2020 (same index)
+  msmarco/<model>/                      QLR historical query log Q_L (train queries)
+
+Datasets/toploc2/                       CACHE_BASE: built indexes + QLR caches (EP/I_Q/GT)
+  snowflake/{exact,ivf,hnsw}_index.index  (+ *_ids.npy)
+  dragon/{exact,ivf,hnsw}_index.index     dragon/_cosine_old/ is read by HNSW/QLR
+                                          (see "Dragon only" under Build Index)
 ```
+
+## `old scripts/`
+
+Earlier, superseded implementations kept for reference — iterations of the TopLoc
+IVF/HNSW work that led to the current `combine_hnsw.py` / `combine_IVF.py`. Not part
+of the pipeline above. The one exception is `toploc_search.cpp` (+ `CMakeLists.txt`):
+the demo still compiles its C++ kernel from here (see `demo/build_demo.sh`), so the
+folder is not removable as a whole.
