@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """
-combine_base_top_hnsw.py
+combine_hnsw.py
 ========================
 Baseline HNSW + TopLoc-HNSW in ONE script.
-
-Purpose
--------
-This is the HNSW analogue of combine_base_top_ivf.py:
-  * load the huge FAISS HNSW index once
-  * load/encode all evaluation queries once
-  * run baseline HNSW and TopLoc-HNSW under the same process/settings
-  * print side-by-side metrics and latency
-  * optionally sweep efSearch values and write a CSV
 
 TopLoc-HNSW logic
 -----------------
@@ -40,24 +31,24 @@ three backends:
 Run (real latency, single thread):
 
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-    python -u combine_base_top_hnsw.py snowflake hnsw --threads 1
+    python -u combine_hnsw.py snowflake hnsw --threads 1
 
 Examples
 --------
 Single efSearch, default EF_SEARCH env var or 64:
-    python -u combine_base_top_hnsw.py snowflake hnsw --threads 1
+    python -u combine_hnsw.py snowflake hnsw --threads 1
 
 Single efSearch explicitly:
-    python -u combine_base_top_hnsw.py snowflake hnsw --ef-search 128 --up 2 --threads 1
+    python -u combine_hnsw.py snowflake hnsw --ef-search 128 --up 2 --threads 1
 
 Sweep:
-    python -u combine_base_top_hnsw.py snowflake hnsw --sweep --threads 1
+    python -u combine_hnsw.py snowflake hnsw --sweep --threads 1
 
 Custom sweep:
-    python -u combine_base_top_hnsw.py snowflake hnsw --sweep 16,32,64,128 --threads 1
+    python -u combine_hnsw.py snowflake hnsw --sweep 16,32,64,128 --threads 1
 
 Debug small run:
-    python -u combine_base_top_hnsw.py snowflake hnsw --max-turns 20 --threads 1
+    python -u combine_hnsw.py snowflake hnsw --max-turns 20 --threads 1
 """
 
 from __future__ import annotations
@@ -109,7 +100,7 @@ def import_cpp_backend():
             "Build it first and set PYTHONPATH, for example:\n"
             "  mkdir -p build_hnsw_release && cd build_hnsw_release\n"
             "  cmake .. -DCMAKE_BUILD_TYPE=Release && make -j && cd ..\n"
-            "  PYTHONPATH=build_hnsw_release python -u combine_base_top_hnsw.py snowflake hnsw --threads 1\n"
+            "  PYTHONPATH=build_hnsw_release python -u combine_hnsw.py snowflake hnsw --threads 1\n"
             "For correctness-only/debugging, you can run with: --backend python"
         ) from exc
 
