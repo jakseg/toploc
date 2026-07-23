@@ -7,3 +7,4 @@ torch
 transformers
 sentence-transformers
 faiss-cpu<1.14
+huggingface_hub
